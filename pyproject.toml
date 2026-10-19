@@ -17,4 +17,3 @@ dev = [
     "workers-runtime-sdk",
 ]
 
-[tool.pywrangler]
