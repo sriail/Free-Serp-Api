@@ -1,14 +1,14 @@
-## Free Serp
-A free, light, and simple serp api using json for responses, python for server side compute, worked for runtime, and js and ts for clients (with inline HTML capabilities)
+# Free Serp
+A free, light, and simple Serp API using JSON for responses, Python for server side compute, Worked for runtime, and JS for clients (with inline HTML capabilities and usability in TS)
 
-# Deploy
+## Deploy
 
 As stated, this projects is intended for the worked runtime due to its low compute cost. you can deploy this project to Cloudflare Workers using the button below
 
 > [!NOTE]
 > If you like this project, please consider giving this repository a star!
 
-# Clients
+## Clients
 
 For quick deploytment / Addition to your applacation, you can use this simple inline HTML Java script
 
