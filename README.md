@@ -4,7 +4,7 @@ A free, light, and simple Serp API using JSON for responses, Python for server s
 ## Deploy
 
 As stated, this projects is intended for the worked runtime due to its low compute cost. you can deploy this project to Cloudflare Workers using the button below
-
+[![Deploy to Cloudflare Workers](https://cloudflare.com)](https://cloudflare.com)
 > [!NOTE]
 > If you like this project, please consider giving this repository a star!
 
