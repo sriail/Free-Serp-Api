@@ -2,3 +2,5 @@ name = "serp-api"
 main = "index.py"
 compatibility_date = "2026-10-18"
 compatibility_flags = ["python_workers"]
+[build]
+command = "uv sync && uv run pywrangler build"
