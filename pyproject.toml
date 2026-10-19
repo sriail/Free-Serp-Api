@@ -1,0 +1,20 @@
+
+[project]
+name = "serp-api"
+version = "0.1.0"
+description = "Simple, Free, Fast, and Light Cloudflare Worker for Returning Serp JSON"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4",
+    "fastapi",
+    "pydantic",
+    "starlette",
+]
+
+[dependency-groups]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+]
+
+[tool.pywrangler]
