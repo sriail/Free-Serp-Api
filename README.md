@@ -9,7 +9,7 @@ As stated, this projects is intended for the worked runtime due to its low compu
 
 Or use these commands (Requires Node JS and NPM Package Manager, and the wrangler / Cloudflare cli Package)
 ```shell
-Install Wrangler (If not already installed)
+# Install Wrangler (If not already installed)
 npm install --save-dev wrangler
 
 # Clone / Prep the repository
