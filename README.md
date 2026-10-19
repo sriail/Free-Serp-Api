@@ -7,6 +7,20 @@ As stated, this projects is intended for the worked runtime due to its low compu
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sriail/Free-Serp-Api)
 
+Or use these commands (Requires Node JS and NPM Package Manager, and the wrangler / Cloudflare cli Package)
+```shell
+Install Wrangler (If not already installed)
+npm install --save-dev wrangler
+
+# Clone / Prep the repository
+git clone https://github.com/sriail/Free-Serp-Api.git
+cd Free-Serp-Api
+
+# Install and Deploy
+npm install
+npx wrangler deploy
+```
+
 > [!NOTE]
 > If you like this project, please consider giving this repository a star!
 
