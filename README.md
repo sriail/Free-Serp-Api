@@ -1,5 +1,5 @@
 # Free Serp
-A free, light, and simple Serp API using JSON for responses, Python for server side compute, Worked for runtime, and JS for clients (with inline HTML capabilities and usability in TS)
+A free, light, and simple Serp API using JSON for responses, Python for server side compute, Worked for runtime, and JS for clients (with inline HTML capabilities and usability in TS) using Microsoft Bing
 
 ## Deploy
 
