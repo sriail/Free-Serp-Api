@@ -1,6 +1,6 @@
 
 [project]
-name = "serp-api"
+name = "free-serp-api"
 version = "0.1.0"
 description = "Simple, Free, Fast, and Light Cloudflare Worker for Returning Serp JSON"
 requires-python = ">=3.13"
