@@ -1,17 +1,4 @@
-# ============================================================================
-# wrangler.toml — bing-search-api
-# ============================================================================
-# Zero bindings: no [kv_namespaces], no [durable_objects], no [queues], no
-# [r2_buckets], no [services], no routes. Plain [vars] only (they are plain
-# text values, not bound resources). A brand-new Cloudflare account deploys
-# this with exactly one command and no setup:
-#
-#     npx wrangler deploy
-#
-# Optional API key (skips [vars]; secrets need no bindings either):
-#     npx wrangler secret put API_KEY
-
-name = "bing-search-api"
+name = "free-search-api"
 main = "worker.js"
 compatibility_date = "2025-10-01"
 workers_dev = true
