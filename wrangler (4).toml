@@ -1,0 +1,38 @@
+# ============================================================================
+# wrangler.toml — bing-search-api
+# ============================================================================
+# Zero bindings: no [kv_namespaces], no [durable_objects], no [queues], no
+# [r2_buckets], no [services], no routes. Plain [vars] only (they are plain
+# text values, not bound resources). A brand-new Cloudflare account deploys
+# this with exactly one command and no setup:
+#
+#     npx wrangler deploy
+#
+# Optional API key (skips [vars]; secrets need no bindings either):
+#     npx wrangler secret put API_KEY
+
+name = "bing-search-api"
+main = "worker.js"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+[vars]
+# --- Engine upstream templates (swap engines here; {query} placeholder) ---
+UPSTREAM_WEB = "https://www.bing.com/search?q={query}"
+UPSTREAM_IMAGES = "https://www.bing.com/images/search?q={query}"
+UPSTREAM_VIDEOS = "https://www.bing.com/videos/search?q={query}"
+
+# --- Host allowlists (comma-separated; SSRF guard for continuation tokens) ---
+UPSTREAM_WEB_HOSTS = "www.bing.com,cn.bing.com"
+UPSTREAM_IMAGES_HOSTS = "www.bing.com,cn.bing.com"
+UPSTREAM_VIDEOS_HOSTS = "www.bing.com,cn.bing.com"
+
+# --- Behaviour knobs (all optional; worker.js has the same defaults) ---
+CACHE_TTL_SECONDS = "60"        # caches.default TTL for fresh result pages
+CORS_ALLOW_ORIGIN = "*"         # or lock down to "https://example.com"
+RATE_LIMIT_RPM = "120"          # APPROXIMATE per-isolate limiter (no KV)
+# UPSTREAM_TIMEOUT_MS = "12000"
+# MAX_CHAIN_PAGES = "100"
+# RATE_LIMIT_ENABLED = "true"
+# CACHE_ENABLED = "true"
+# API_KEY = "change-me"         # prefer `wrangler secret put API_KEY`
