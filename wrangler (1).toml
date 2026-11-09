@@ -1,0 +1,99 @@
+# ============================================================================
+# Free SERP API v2 — Cloudflare Worker project configuration
+# ============================================================================
+# Deploy:        wrangler deploy
+# Local dev:     wrangler dev        (http://127.0.0.1:8787/api/v1/)
+# Tail logs:     wrangler tail
+#
+# IMPORTANT — how configuration values reach the Worker:
+#   * [vars] values are ALWAYS plain strings (wrangler does not support typed
+#     vars). The Worker parses them itself:
+#       REQUIRE_KEY           -> boolean via "true"/"1" (case-insensitive)
+#       *_MS / *_BYTES / etc. -> integers via parseInt
+#   * Secrets are NOT stored in this file. Set them with the CLI:
+#       wrangler secret put API_KEYS
+#     (API_KEYS = comma-separated list of accepted keys,
+#      e.g. "alpha-key-123,beta-key-456"). Secrets are only read when
+#     REQUIRE_KEY = "true".
+#   * For local development ONLY you may uncomment [unsafe_secrets] below —
+#     NEVER commit real keys there.
+# ============================================================================
+
+name = "free-serp-api"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+
+# Serve on <name>.<account-subdomain>.workers.dev (no custom domain needed).
+# For a custom domain/route instead, comment this in:
+workers_dev = true
+# routes = [
+#   { pattern = "api.example.com/api/v1/*", zone_name = "example.com" },
+# ]
+
+# ---------------------------------------------------------------------------
+# Environment variables (non-secret). All values are strings — see note above.
+# ---------------------------------------------------------------------------
+[vars]
+# Authentication toggle. Default OFF: the endpoint answers without a `key`.
+# Flip to "true" in production to require the `key` field (checked against the
+# API_KEYS secret).
+REQUIRE_KEY = "false"
+
+# Maximum number of concurrent outbound GET requests to Bing. Any additional
+# POST requests wait in a FIFO queue (see QUEUE_WAIT_TIMEOUT_MS). 6 = spec.
+BING_MAX_CONCURRENCY = "6"
+
+# Per-Bing-page timeout (milliseconds). On timeout the request fails with
+# 504 upstream_timeout (after one retry on 429/5xx).
+BING_FETCH_TIMEOUT_MS = "8000"
+
+# How long a POST request may wait in the concurrency queue before failing
+# with 504 queue_timeout. 0 = wait indefinitely (not recommended).
+QUEUE_WAIT_TIMEOUT_MS = "10000"
+
+# Request body size limit (bytes).
+MAX_BODY_BYTES = "16384"
+
+# Upper bound for `result_number` (1..100 per the API schema).
+MAX_RESULT_NUMBER = "100"
+
+# Hard cap on Bing pages fetched per request (pagination).
+MAX_PAGES = "10"
+
+# CORS policy: "*" (any origin) or a comma-separated allowlist, e.g.
+# "https://app.example.com,https://docs.example.com".
+ALLOWED_ORIGINS = "*"
+
+# Optional per-IP rate limit (requests/minute, per isolate). 0 = disabled.
+RATE_LIMIT_PER_MINUTE = "0"
+
+# ---------------------------------------------------------------------------
+# Observability (Workers Logs): structured console output from the Worker.
+# ---------------------------------------------------------------------------
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+
+# ---------------------------------------------------------------------------
+# Production environment example — deploy with: wrangler deploy --env production
+# ---------------------------------------------------------------------------
+# [env.production]
+# workers_dev = false
+# routes = [
+#   { pattern = "api.example.com/api/v1/*", zone_name = "example.com" },
+# ]
+#
+# [env.production.vars]
+# REQUIRE_KEY = "true"
+# BING_MAX_CONCURRENCY = "6"
+# ALLOWED_ORIGINS = "https://app.example.com"
+# RATE_LIMIT_PER_MINUTE = "30"
+#
+# [env.production.observability]
+# enabled = true
+
+# ---------------------------------------------------------------------------
+# LOCAL DEVELOPMENT ONLY — never commit real values:
+# ---------------------------------------------------------------------------
+# [unsafe_secrets]
+# API_KEYS = "dev-local-key"

@@ -1,0 +1,16 @@
+{
+  "name": "free-serp-api",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker search proxy API (Free SERP API v2) + browser client + validation tests.",
+  "scripts": {
+    "test": "node tests/worker.test.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
