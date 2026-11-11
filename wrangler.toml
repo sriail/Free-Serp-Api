@@ -1,67 +1,67 @@
+# ============================================================================
+#  free-serp-api — wrangler configuration  ·  v1.1.0
+# ============================================================================
+#  Deploy:            npx wrangler deploy
+#  Local dev:         npx wrangler dev           (http://127.0.0.1:8787)
+#  Add API keys:      npx wrangler secret put KEY-1     (then KEY-2, KEY-3, …)
+#  Tail live logs:    npx wrangler tail
+#
+#  Layout: this file, worker.js and script.js in the same directory:
+#      free-serp-api/
+#      ├── wrangler.toml   ← you are here
+#      ├── worker.js       ← the entire server (single-file, zero-dependency)
+#      ├── script.js       ← optional companion browser/Node client
+#      ├── tests.mjs       ← offline validation suite (node tests.mjs)
+#      └── fixtures/       ← Bing SERP sample used by tests.mjs
+# ============================================================================
+
 name = "free-serp-api"
 main = "worker.js"
-compatibility_date = "2025-09-01"
-
+compatibility_date = "2025-06-01"
 workers_dev = true
-[vars]
-# Authentication toggle. Default OFF: the endpoint answers without a `key`.
-# Flip to "true" in production to require the `key` field (checked against the
-# API_KEYS secret).
-REQUIRE_KEY = "false"
-
-# Maximum number of concurrent outbound GET requests to Bing. Any additional
-# POST requests wait in a FIFO queue (see QUEUE_WAIT_TIMEOUT_MS). 6 = spec.
-BING_MAX_CONCURRENCY = "6"
-
-# Per-Bing-page timeout (milliseconds). On timeout the request fails with
-# 504 upstream_timeout (after one retry on 429/5xx).
-BING_FETCH_TIMEOUT_MS = "8000"
-
-# How long a POST request may wait in the concurrency queue before failing
-# with 504 queue_timeout. 0 = wait indefinitely (not recommended).
-QUEUE_WAIT_TIMEOUT_MS = "10000"
-
-# Request body size limit (bytes).
-MAX_BODY_BYTES = "16384"
-
-# Upper bound for `result_number` (1..100 per the API schema).
-MAX_RESULT_NUMBER = "100"
-
-# Hard cap on Bing pages fetched per request (pagination).
-MAX_PAGES = "10"
-
-# CORS policy: "*" (any origin) or a comma-separated allowlist, e.g.
-# "https://app.example.com,https://docs.example.com".
-ALLOWED_ORIGINS = "*"
-
-# Optional per-IP rate limit (requests/minute, per isolate). 0 = disabled.
-RATE_LIMIT_PER_MINUTE = "0"
-
+# For a custom route instead of *.workers.dev, uncomment and edit:
+# routes = [{ pattern = "api.example.com/api/v1/*", custom_domain = true }]
 
 [observability]
 enabled = true
 head_sampling_rate = 1.0
 
-# ---------------------------------------------------------------------------
-# Production environment example — deploy with: wrangler deploy --env production
-# ---------------------------------------------------------------------------
-# [env.production]
-# workers_dev = false
-# routes = [
-#   { pattern = "api.example.com/api/v1/*", zone_name = "example.com" },
-# ]
-#
-# [env.production.vars]
-# REQUIRE_KEY = "true"
-# BING_MAX_CONCURRENCY = "6"
-# ALLOWED_ORIGINS = "https://app.example.com"
-# RATE_LIMIT_PER_MINUTE = "30"
-#
-# [env.production.observability]
-# enabled = true
+# Optional CPU guard (default is fine for this workload — parsing is ~ms):
+# [limits]
+# cpu_ms = 50
 
-# ---------------------------------------------------------------------------
-# LOCAL DEVELOPMENT ONLY — never commit real values:
-# ---------------------------------------------------------------------------
-# [unsafe_secrets]
-# API_KEYS = "dev-local-key"
+[vars]
+# ----------------------------------------------------------------------------
+# PUBLIC configuration (NOT secret — safe to commit).
+# Cloudflare [vars] are always strings on the `env` object.
+# ----------------------------------------------------------------------------
+
+# Authentication toggle. "false" (default) → the API is open, `key` in the
+# request body is ignored entirely. "true" → every request must carry a `key`
+# matching one of the KEY-1 … KEY-n secrets (set via `wrangler secret put`).
+REQUIRE_KEY = "false"
+
+# Client rate limiting, per client IP (CF-Connecting-IP), sliding 60 s window.
+#   "0"        → unlimited (default)
+#   "<number>" → fixed maximum requests per minute (e.g. "60" = 60 req/min)
+# Limited responses get HTTP 429 + Retry-After + X-Rate-Limit-* headers.
+RATE_LIMIT = "0"
+
+# Default target language when a request omits "lang" (RFC-1766 code).
+DEFAULT_LANG = "en-US"
+
+# CORS: "*" (default, no credentials are ever used) or a comma-separated list
+# of exact origins, e.g. "https://example.com,https://app.example.com".
+CORS_ORIGIN = "*"
+
+# Optional operational overrides (safe defaults if omitted):
+# QUEUE_WAIT_MS        = "15000"   # max wait for a free Bing slot before 503
+# UPSTREAM_TIMEOUT_MS  = "10000"   # per-attempt timeout fetching Bing
+
+# ----------------------------------------------------------------------------
+# SECRETS — never put real key values in this file. Use the CLI instead:
+#    npx wrangler secret put KEY-1
+#    npx wrangler secret put KEY-2
+# They surface as env["KEY-1"], env["KEY-2"], … and are only consulted when
+# REQUIRE_KEY = "true". Keys are compared in constant time.
+# ----------------------------------------------------------------------------
