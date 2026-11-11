@@ -1,1307 +1,1252 @@
 /**
  * ============================================================================
- * Free SERP API — v2.0.0 — Cloudflare Worker (search proxy)
+ *  free-serp-api — Cloudflare Worker (search proxy API)  ·  v1.1.0
  * ============================================================================
  *
- * ENDPOINT
- *   POST /api/v1/            (also accepts POST /api/v1 — trailing slash optional)
- *   OPTIONS /api/v1/         CORS preflight (browser clients)
+ *  POST /api/v1/            → execute a search query (see README.md / openapi.yaml)
+ *  POST /api/v1/search      → alias (also POST /search, for OpenAPI compatibility)
+ *  GET  /api/v1/            → service info (key-required?, rate-limit, endpoints)
+ *  GET  /api/v1/key-status  → minimal "environment key check"
+ *  GET  /demo               → self-hosted browser test page (prints to console)
  *
- * REQUEST BODY (application/json) — see OpenAPI 3.1 schema in project spec:
- *   {
- *     "request":        "quantum computing",        // required, 1..400 chars
- *     "lang":           "es",                        // optional, BCP-47-ish code
- *     "key":            "your-api-key",              // optional; only checked when REQUIRE_KEY=true
- *     "include_favicon": false,                      // optional, boolean, default false
- *     "result_number":  10                           // optional, integer 1..100, default 10
- *   }
- *   Unknown fields are ignored (open-world schema).
- *   Tolerated coercions (documented, deliberate): "result_number" given as a
- *   numeric string ("10") and "include_favicon" given as "true"/"false".
+ *  REQUEST BODY (application/json):
+ *    {
+ *      "is-stream":     false,          // required. true → paginated streaming protocol
+ *      "stream-id":     "<cursor>",     // required on subsequent streaming requests
+ *      "query":         "quantum computing", // required, 1..512 chars
+ *      "results":       10,             // required, integer 1..100
+ *      "lang":          "en-US",        // optional target language code (default env DEFAULT_LANG)
+ *      "favicon":       false,          // optional: include favicon URL on every result
+ *      "show-telemetry": false,         // optional: include shown-telemetry block
+ *      "key":           "…"             // optional: only enforced when REQUIRE_KEY="true"
+ *    }
  *
- * RESPONSE 200 (application/json) — conforms to the OpenAPI schema:
- *   {
- *     "query": "...",                  // original query (trimmed)
- *     "translated_query": "...",       // only present when `lang` was sent
- *     "total_results": 50900,          // parsed from Bing "sb_count"
- *     "response_time_ms": 245,
- *     "request_id": "uuid",            // additive extension (ops correlation)
- *     "url_tree": [ { "category": "wikipedia.org", "subcategories": ["/wiki"] } ],
- *     "latency_info": {
- *       "inflight_time_ms": 210,       // queue wait + upstream fetch time
- *       "search_execution_ms": 180,    // upstream fetch time only
- *       "queue_wait_ms": 30,           // additive: time waiting for a concurrency slot
- *       "pages_fetched": 1,            // additive: Bing pages fetched (pagination)
- *       "parsing_ms": 4,               // additive: HTML parsing time
- *       "queue_depth": 0               // additive: requests currently queued (this isolate)
- *     },
- *     "results": [
- *       {
- *         "title": "...",
- *         "url": "https://en.wikipedia.org/wiki/Quantum_computing",  // decoded from /ck/a
- *         "snippet": "...",
- *         "favicon": "https://icons.duckduckgo.com/ip3/en.wikipedia.org.ico", // if include_favicon
- *         "quality": "Best"            // heuristic tier: Best|Better|Good|Mild|Subpar|Poor|Unknown
- *       }
- *     ]
- *   }
+ *  RESPONSE 200:
+ *    {
+ *      "shown-telemetry": { "que-time", "in-flight", "parse-time", "total-time",
+ *                           "time-grade": "A".."F", "ping" },          // only when requested
+ *      "stream-id": "…", "has-more": true,                            // only when is-stream
+ *      "stats": { "total-results": 50900 },
+ *      "results": [ { "rank", "title", "url", "favicon?", "path?", "summary?" } ]
+ *    }
  *
- * ERROR ENVELOPE (all non-200):
- *   { "error": "<machine_code>", "message": "<human readable>", "details"?: {...} }
- *   400 invalid_body | invalid_json | missing_query | invalid_query | invalid_lang |
- *        invalid_key | invalid_include_favicon | invalid_result_number | out_of_range_result_number
- *   401 unauthorized                     — REQUIRE_KEY=true and key missing/invalid
- *   404 not_found                        — unknown route
- *   405 method_not_allowed               — non-POST/OPTIONS on /api/v1/
- *   413 payload_too_large                — body > MAX_BODY_BYTES
- *   415 unsupported_media_type           — Content-Type not JSON
- *   429 rate_limited                     — per-isolate per-IP limiter (disabled by default)
- *   500 server_misconfigured | internal_error
- *   502 upstream_error | upstream_empty  — Bing returned HTTP error
- *   502 upstream_changed                 — Bing layout changed (no results container)
- *   504 upstream_timeout | queue_timeout — fetch timeout / concurrency queue timeout
+ *  ERRORS: JSON { "error": "<CODE>", "message": "…" } + response headers
+ *          X-Error-Code / X-Failure-Reason / X-Request-Id on every error.
+ *          400 validation · 401 auth · 404 route · 405 method · 413 payload size
+ *          415 media type · 429 rate limit · 502 fetch/parse · 503 queue timeout · 500 internal
  *
- * ARCHITECTURE
- *   1. Router            — path + method + CORS preflight handling.
- *   2. Body & payload    — size/type guards, JSON parse, strict-but-tolerant validation.
- *   3. Auth              — REQUIRE_KEY flag (wrangler var, default "false" = OPEN endpoint)
- *                          + API_KEYS secret (comma-separated), SHA-256 constant-time compare.
- *   4. Concurrency queue — a module-scope FIFO semaphore admits at most
- *                          BING_MAX_CONCURRENCY (default 6) in-flight outbound GETs to Bing.
- *                          Excess POST requests wait in the queue (QUEUE_WAIT_TIMEOUT_MS)
- *                          and fail with 504 queue_timeout rather than thundering Bing.
- *                          NOTE (Workers execution model): module state is per-isolate.
- *                          The 6-slot guarantee holds per isolate; for a hard global
- *                          cap across isolates, wrap the same FairSemaphore in a
- *                          Durable Object (fetch() → this.limiter) — drop-in upgrade,
- *                          see "SCALING" note at the bottom of this file.
- *   5. Upstream client   — always requests https://www.bing.com/search?q=<q>&webscp=1
- *                          (+ setlang/mkt for localization, + first= for pagination),
- *                          with a CLEAN allowlisted header set: inbound Cloudflare
- *                          proxy headers (cf-*, x-forwarded-*, cdn-loop, true-client-ip,
- *                          cookie, ...) are never forwarded — they are stripped by
- *                          construction. Per-page timeout + one retry on 429/5xx.
- *   6. Parser            — layout-resilient, tiered strategies (see parseSerp):
- *                          tier A: <li class="b_algo"> blocks (primary, current Bing);
- *                          tier B: h2-anchor harvest anywhere (layout drift fallback);
- *                          tier C: container-missing => 502 upstream_changed (fails loud
- *                          instead of silently returning empty results).
- *                          Bing /ck/a tracking redirects are always decoded
- *                          (u=a1<base64url> -> clean destination URL).
+ *  BING PIPELINE:
+ *    · URL is always  https://www.bing.com/search?q=<encoded>&webscp=1[&count=&first=&setmkt=&setlang=]
+ *      ("webscp=1" is unconditionally appended).
+ *    · Outbound requests are built from scratch: no inbound CF/proxy headers are forwarded
+ *      (cf-*, x-forwarded-*, cdn-loop, cookie, … are stripped — see STRIP_OUTBOUND_HEADERS),
+ *      and browser-like headers (User-Agent, Accept, Accept-Language, Referer, …) are injected.
+ *    · Outbound concurrency is capped at 6 simultaneous GETs to Bing (per isolate).
+ *      Excess requests wait in a FIFO queue (max wait = env QUEUE_WAIT_MS, default 15 s)
+ *      and time out with 503 QUEUE_TIMEOUT.
  *
- * QUALITY HEURISTIC (documented, deterministic; enum per OpenAPI):
- *   position 1 -> Best, 2-3 -> Better, 4-6 -> Good, 7-10 -> Mild, >10 -> Subpar
- *   +1 tier for .gov/.edu/.mil/.int domains (cap Best)
- *   -1 tier for plain http:// (floor Poor) and for deep pagination pages (floor Poor)
- *   no snippet -> "Unknown"
+ *  CONFIG (wrangler.toml [vars], all values are strings):
+ *    REQUIRE_KEY   "false" (default) | "true"  → enforce `key` against KEY-1..KEY-n secrets
+ *    RATE_LIMIT    "0" (default = unlimited) | "<n>" → client requests per minute per IP
+ *    DEFAULT_LANG  "en-US"  ·  CORS_ORIGIN  "*" (or comma-separated exact origins)
+ *    QUEUE_WAIT_MS "15000"  ·  UPSTREAM_TIMEOUT_MS "10000"   (optional overrides)
  *
+ *  Secrets (never in wrangler.toml):  wrangler secret put KEY-1   (KEY-2, KEY-3, …)
+ *
+ *  This file is dependency-free, uses only standard Worker/JS APIs (no HTMLRewriter →
+ *  the tiered-regex parser below also runs in Node 18+, which the offline test-suite
+ *  exploits for automated validation). Named exports exist purely for testing/tooling;
+ *  Cloudflare only consumes `export default { fetch }`.
  * ============================================================================
  */
 
-// ---------------------------------------------------------------------------
-// Configuration & constants
-// ---------------------------------------------------------------------------
+/* ============================== entry point ============================== */
 
-const VERSION = "2.0.0";
+export default { fetch };
 
-const BING_ORIGIN = "https://www.bing.com";
-const BING_SEARCH_PATH = "/search";
-
-const LIMITS = {
-  queryMaxChars: 400,
-  keyMaxChars: 256,
-  resultNumberMin: 1,
-  resultNumberMax: 100,
-  maxPagesHardCap: 10,        // never fetch more Bing pages than this per request
-  minResultsPerPageGuess: 5,  // used to bound the pagination loop
-  retryStatuses: [429, 500, 502, 503, 504],
-  maxFetchAttempts: 2,        // 1 attempt + 1 retry
+export {
+  /* — testing / tooling exports (not used by the runtime router) — */
+  Semaphore,
+  scrubProxyHeaders,
+  buildOutboundHeaders,
+  buildBingUrl,
+  validatePayload,
+  authorize,
+  timingSafeEqual,
+  rateCheck,
+  parseRateLimit,
+  requireKeyFlag,
+  encodeCursor,
+  decodeCursor,
+  b64UrlDecode,
+  decodeBingRedirect,
+  decodeEntities,
+  cleanText,
+  parseBingSerp,
+  gradeFromMs,
+  ApiError,
+  __testHooks,
 };
 
-const QUALITY_TIERS = ["Poor", "Subpar", "Mild", "Good", "Better", "Best"];
+/* ================================ constants =============================== */
+
+const VERSION = '1.1.0';
+
+const BING_ORIGIN = 'https://www.bing.com';
+const BING_SEARCH_PATH = '/search';
+
+/** Maximum simultaneous outbound GETs to Bing (per isolate). */
+const OUTBOUND_CONCURRENCY = 6;
+/** Default max time a request may wait for a free Bing slot. */
+const DEFAULT_QUEUE_WAIT_MS = 15_000;
+/** Default per-attempt timeout for the Bing fetch. */
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 10_000;
+/** Failed upstream attempts are retried once (2 attempts total). */
+const UPSTREAM_RETRIES = 1;
+const RETRY_DELAY_MS = 400;
+
+/** Bing page size ceiling (count=). */
+const PAGE_SIZE_MAX = 50;
+/** Non-streaming requests may stitch up to this many Bing pages. */
+const NONSTREAM_MAX_PAGES = 3;
+/** Bing deep-paging ceiling for the `first` parameter. */
+const BING_FIRST_MAX = 300;
+
+const MAX_BODY_BYTES = 65_536;
+const MAX_QUERY_CHARS = 512;
+const RESULTS_MIN = 1;
+const RESULTS_MAX = 100;
+
+const RATE_WINDOW_MS = 60_000;
+const RATE_BUCKETS_MAX = 5_000; // per-isolate memory hygiene
+
+const GRADE_TABLE = [
+  [400, 'A'],
+  [800, 'B'],
+  [1500, 'C'],
+  [3000, 'D'],
+];
+
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+
+const LANG_RE = /^[A-Za-z]{2}(?:-[A-Za-z]{2,8})?$/; // case-insensitive input, normalized to xx / xx-XX / xx-Script
+const STREAM_ID_RE = /^[A-Za-z0-9_-]+$/;
+const CORS_ALLOW_HEADERS = ['content-type', 'x-client-sent-at'];
+const CORS_EXPOSE_HEADERS = [
+  'x-error-code',
+  'x-failure-reason',
+  'x-request-id',
+  'x-rate-limit-limit',
+  'x-rate-limit-remaining',
+  'x-rate-limit-reset',
+  'server-timing',
+];
 
 /**
- * Outbound header allowlist. Everything else (in particular all Cloudflare /
- * proxy headers attached to the inbound request) is stripped by construction:
- * the outbound Headers object is built from this map only.
- * `Accept-Encoding` is deliberately NOT set — the Workers runtime negotiates
- * compression itself and transparently decompresses `res.text()`.
- * `Sec-Fetch-*` headers are deliberately omitted: they are runtime-restricted
- * on some fetch implementations and provide little scraping benefit.
+ * Inbound/outbound header hygiene: none of these may ever reach Bing.
+ * Cloudflare injects some of these on the *network* layer (outside JS control,
+ * see README "Header hygiene"); this list guarantees application-level control.
  */
-const OUTBOUND_HEADER_ALLOWLIST = {
-  "user-agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "cache-control": "no-cache",
-  pragma: "no-cache",
-  dnt: "1",
-  "upgrade-insecure-requests": "1",
-};
-
-/** Never read (except the rate-limit key), never echoed, never forwarded. */
-const STRIP_INBOUND = [
-  "cf-connecting-ip", "cf-ipcountry", "cf-ray", "cf-visitor", "cf-worker",
-  "cf-access-client-id", "x-forwarded-for", "x-forwarded-proto",
-  "x-forwarded-host", "x-real-ip", "true-client-ip", "cdn-loop",
-  "cookie", "authorization",
+const STRIP_OUTBOUND_HEADERS = [
+  'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker', 'cf-ect',
+  'cf-mitigated', 'cf-access-client-id', 'cf-bot-score', 'cf-poisoned-request-id',
+  'true-client-ip', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
+  'x-forwarded-server', 'x-real-ip', 'cdn-loop', 'forwarded', 'via',
+  'cookie', 'authorization', 'proxy-authorization',
+  'host', 'connection', 'content-length', 'transfer-encoding', 'keep-alive',
+  'te', 'upgrade', 'expect', 'referer-policy',
 ];
 
-/** Defensive check: these must never appear in the outbound header map. */
-const FORBIDDEN_OUTBOUND = [
-  ...STRIP_INBOUND, "host", "content-length", "transfer-encoding",
-  "connection", "accept-encoding", "sec-fetch-site", "sec-fetch-mode",
-];
+/* =============================== tiny utils =============================== */
 
-/** Common language code -> Bing market (improves localization of results). */
-const LANG_TO_MKT = {
-  en: "en-US", es: "es-ES", fr: "fr-FR", de: "de-DE", it: "it-IT",
-  pt: "pt-PT", nl: "nl-NL", ru: "ru-RU", ja: "ja-JP", ko: "ko-KR",
-  zh: "zh-CN", ar: "ar-SA", hi: "hi-IN", bn: "bn-BD", tr: "tr-TR",
-  pl: "pl-PL", sv: "sv-SE", da: "da-DK", fi: "fi-FI", no: "nb-NO",
-  nb: "nb-NO", cs: "cs-CZ", el: "el-GR", he: "he-IL", th: "th-TH",
-  vi: "vi-VN", id: "id-ID", uk: "uk-UA", ro: "ro-RO", hu: "hu-HU",
-  ms: "ms-MY", fa: "fa-IR", ur: "ur-PK",
-};
+const now = () => Date.now();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const round1 = (n) => Math.round(n * 10) / 10;
+const safeMsg = (e) =>
+  e instanceof Error ? `${e.name}: ${e.message}` : String(e && e.message ? e.message : e);
 
-// ---------------------------------------------------------------------------
-// Small utilities
-// ---------------------------------------------------------------------------
-
-const utf8Encoder = new TextEncoder();
-const utf8Decoder = new TextDecoder("utf-8");
-
-const nowMs = () => Date.now();
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Parse a wrangler var (always a string) into an integer with a default. */
-function intVal(value, fallback) {
-  const n = parseInt(String(value ?? "").trim(), 10);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-/** Interpret wrangler vars as booleans ("true"/"1", case-insensitive). */
-function isTruthy(value) {
-  return value === true || /^(true|1)$/i.test(String(value ?? "").trim());
-}
-
-function newRequestId() {
+function uuid() {
   try {
-    return crypto.randomUUID();
-  } catch {
-    return `rid-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
-  }
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  } catch { /* fall through */ }
+  const b = new Uint8Array(16);
+  (crypto && crypto.getRandomValues ? crypto : { getRandomValues: (a) => { for (let i = 0; i < a.length; i++) a[i] = (Math.random() * 256) | 0; return a; } }).getRandomValues(b);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
-/** JSON response with security + CORS headers (never echoes upstream headers). */
-function jsonResponse(status, body, extraHeaders = {}) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-      ...extraHeaders,
-    },
-  });
-}
+/* ================================ ApiError ================================ */
 
-/** Controlled, schema-shaped error. Thrown anywhere, mapped once in the router. */
-class HttpError extends Error {
-  constructor(status, code, message, details) {
+/** Typed operational error → mapped to an HTTP response with X-Error-* headers. */
+class ApiError extends Error {
+  constructor(status, code, reason, message) {
     super(message);
-    this.name = "HttpError";
+    this.name = 'ApiError';
     this.status = status;
     this.code = code;
-    this.details = details;
+    this.reason = reason;
   }
 }
 
-// ---------------------------------------------------------------------------
-// HTML helpers (entities, tags, base64url)
-// ---------------------------------------------------------------------------
+/* ========================== concurrency queue (6) ========================= */
+/**
+ * FIFO semaphore. `acquire()` resolves as soon as one of OUTBOUND_CONCURRENCY
+ * slots is free, or rejects with QUEUE_TIMEOUT after `timeoutMs`. `release()`
+ * hands the slot directly to the longest-waiting acquirer (no slot churn).
+ */
+class Semaphore {
+  constructor(limit) {
+    this.limit = limit;
+    this.active = 0;
+    this.queue = []; // { resolve, reject, timer, settled, queuedAt }
+  }
+
+  get depth() {
+    return this.queue.length;
+  }
+
+  acquire(timeoutMs = 0) {
+    const queuedAt = now();
+    if (this.active < this.limit) {
+      this.active++;
+      return Promise.resolve({ waitedMs: 0 });
+    }
+    return new Promise((resolve, reject) => {
+      const entry = { resolve, reject, timer: null, settled: false, queuedAt };
+      entry.timer = setTimeout(() => {
+        if (entry.settled) return;
+        entry.settled = true;
+        const i = this.queue.indexOf(entry);
+        if (i !== -1) this.queue.splice(i, 1);
+        reject(new ApiError(503, 'QUEUE_TIMEOUT', 'OVERLOADED', `Bing request queue wait exceeded ${timeoutMs} ms.`));
+      }, timeoutMs);
+      this.queue.push(entry);
+    }).then(() => ({ waitedMs: now() - queuedAt }));
+  }
+
+  release() {
+    const next = this.queue.shift();
+    if (next) {
+      if (next.settled) return this.release(); // timed-out entry (defensive)
+      next.settled = true;
+      clearTimeout(next.timer);
+      next.resolve(); // slot hand-off: `active` count intentionally unchanged
+    } else {
+      this.active = Math.max(0, this.active - 1);
+    }
+  }
+}
+
+/** Module-level (per-isolate) queue guarding all outbound Bing GETs. */
+let bingQueue = new Semaphore(OUTBOUND_CONCURRENCY);
+
+/* ============================== rate limiting ============================= */
+/**
+ * Sliding-window per-IP limiter (per isolate). limit <= 0 → unlimited.
+ * Returns { allowed, retryAfterMs?, remaining?, resetAt? }.
+ */
+const rateBuckets = new Map(); // ip → sorted timestamps (ms)
+
+function rateCheck(ip, limit, nowMs = now()) {
+  if (!(limit > 0)) return { allowed: true, unlimited: true };
+  const cutoff = nowMs - RATE_WINDOW_MS;
+  let arr = rateBuckets.get(ip);
+  if (!arr) {
+    arr = [];
+    rateBuckets.set(ip, arr);
+  }
+  while (arr.length && arr[0] <= cutoff) arr.shift();
+  if (arr.length >= limit) {
+    return { allowed: false, retryAfterMs: arr[0] + RATE_WINDOW_MS - nowMs };
+  }
+  arr.push(nowMs);
+  if (rateBuckets.size > RATE_BUCKETS_MAX) {
+    for (const [k, v] of rateBuckets) {
+      if (!v.length || v[v.length - 1] <= cutoff) rateBuckets.delete(k);
+    }
+  }
+  return {
+    allowed: true,
+    remaining: limit - arr.length,
+    resetAt: arr[0] + RATE_WINDOW_MS,
+  };
+}
+
+function parseRateLimit(v) {
+  const n = parseInt(String(v ?? '0'), 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function requireKeyFlag(env) {
+  return String(env && env.REQUIRE_KEY != null ? env.REQUIRE_KEY : 'false').trim().toLowerCase() === 'true';
+}
+
+/* ============================ base64url helpers =========================== */
+
+function b64UrlDecode(s) {
+  let b = String(s).replace(/-/g, '+').replace(/_/g, '/');
+  while (b.length % 4) b += '=';
+  const bin = atob(b); // throws on invalid input → caller handles
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+function b64UrlEncodeStr(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/* ===================== HTML text / entity sanitization ==================== */
 
 const NAMED_ENTITIES = {
-  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00A0",
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', hellip: '…',
+  rsquo: '\u2019', lsquo: '\u2018', ldquo: '\u201C', rdquo: '\u201D',
+  mdash: '\u2014', ndash: '\u2013', middot: '\u00B7', copy: '\u00A9',
+  reg: '\u00AE', trade: '\u2122', eacute: '\u00E9', egrave: '\u00E8',
+  auml: '\u00E4', ouml: '\u00F6', uuml: '\u00FC', szlig: '\u00DF',
 };
 
-/** Minimal, dependency-free HTML entity decoder (&amp; &lt; &#39; &#x27; ...). */
-function decodeEntities(str) {
-  if (!str) return "";
-  return str.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (all, entity) => {
-    if (entity[0] === "#") {
-      const code =
-        entity[1] === "x" || entity[1] === "X"
-          ? parseInt(entity.slice(2), 16)
-          : parseInt(entity.slice(1), 10);
-      return Number.isInteger(code) && code > 0 && code <= 0x10ffff
-        ? String.fromCodePoint(code)
-        : all;
+/** Decode the subset of HTML entities that occur in Bing SERP markup (once, no re-parse). */
+function decodeEntities(s) {
+  if (!s) return s;
+  return s.replace(/&(#[xX]?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{1,31});/g, (m, g) => {
+    if (g[0] === '#') {
+      const hex = g[1] === 'x' || g[1] === 'X';
+      const code = parseInt(g.slice(hex ? 2 : 1), hex ? 16 : 10);
+      if (!Number.isFinite(code) || code < 0x20 || code > 0x10ffff) return m;
+      try { return String.fromCodePoint(code); } catch { return m; }
     }
-    const name = entity.toLowerCase();
-    return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, name)
-      ? NAMED_ENTITIES[name]
-      : all;
+    const name = g.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, name) ? NAMED_ENTITIES[name] : m;
   });
 }
 
-/** Remove tags, then decode entities, then collapse whitespace. */
-function stripTags(html) {
-  if (!html) return "";
-  return decodeEntities(String(html).replace(/<[^>]*>/g, " "))
-    .replace(/\s+/g, " ")
-    .trim();
+/** Strip all tags, decode entities, collapse whitespace. `space` controls tag→'' vs tag→' '. */
+function cleanText(htmlFragment, { space = false } = {}) {
+  if (!htmlFragment) return '';
+  let s = String(htmlFragment)
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]*>/g, space ? ' ' : '');
+  s = decodeEntities(s);
+  s = s.replace(/\s+/g, ' ').trim();
+  return s;
 }
 
-/** base64url -> UTF-8 string (Workers + Node compatible). */
-function b64urlDecode(input) {
-  let b64 = input.replace(/-/g, "+").replace(/_/g, "/");
-  while (b64.length % 4 !== 0) b64 += "=";
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return utf8Decoder.decode(bytes);
-}
-
-/** Extract a double- or single-quoted attribute value from a tag string. */
-function attrValue(tag, name) {
-  const m = new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"`, "i").exec(tag) ||
-    new RegExp(`\\b${name}\\s*=\\s*'([^']*)'`, "i").exec(tag);
-  return m ? m[1] : null;
-}
-
-// ---------------------------------------------------------------------------
-// Bing tracking-redirect decoding (/ck/a?...&u=a1<base64url> -> clean URL)
-// ---------------------------------------------------------------------------
-
+/* ===================== Bing tracking-redirect decoding ==================== */
 /**
- * Decode Bing tracking links of the shape
- *   https://www.bing.com/ck/a?!&&p=...&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS8...&ntb=1
- * into their clean destination URL. The `u` parameter is a version prefix
- * ("a1") followed by the base64url-encoded target URL.
- *
- * Failure policy: NEVER throw — if anything is undecodable the original href
- * is returned so callers can still filter/skip it downstream.
+ * Turn `https://www.bing.com/ck/a?!&&p=…&u=a1<base64url>&ntb=1` into the clean
+ * destination URL. Handles: `a1`/`a2`/`a3` prefixes, URL-safe and standard
+ * base64, percent-encoding (URLSearchParams decodes once), entity-encoded
+ * input (caller pre-decodes), and both absolute and (rare) relative targets.
+ * Any failure → returns the input unchanged (graceful degradation).
  */
 function decodeBingRedirect(href) {
-  if (!href || typeof href !== "string") return "";
-  let h = href.trim().replace(/&amp;/g, "&");
-  if (!/\/ck\/[a-z]\?/i.test(h)) return h; // not a tracking redirect
+  if (!href || typeof href !== 'string') return href;
   try {
-    const u = new URL(h, BING_ORIGIN);
-    const raw = u.searchParams.get("u") || "";
-    const m = /^a\d(.+)$/s.exec(raw);
-    if (!m) return h;
-    let decoded = b64urlDecode(m[1]);
-    if (/^https?%3a%2f%2f/i.test(decoded)) {
-      try { decoded = decodeURIComponent(decoded); } catch { /* keep as-is */ }
-    }
+    const raw = href.trim();
+    if (!/(^|\.)bing\.com\/ck\//i.test(raw) && !/^\/ck\//i.test(raw)) return raw; // not a tracking link
+    const u = new URL(raw, BING_ORIGIN);
+    if (!/\/ck\//.test(u.pathname)) return raw;
+    let p = u.searchParams.get('u') || u.searchParams.get('url');
+    if (!p) return raw;
+    if (/^https?:\/\//i.test(p)) return p; // some variants carry a plain URL
+    if (/^a\d/i.test(p)) p = p.slice(2); // strip 'a1' / 'a2' / 'a3' prefix
+    const decoded = b64UrlDecode(p);
     if (/^https?:\/\//i.test(decoded)) return decoded;
-    return h; // decoded to something unexpected — keep original
+    return raw; // relative/internal target → keep original link
   } catch {
-    return h;
+    return href;
   }
 }
 
-// ---------------------------------------------------------------------------
-// CORS
-// ---------------------------------------------------------------------------
-
+/* ========================== SERP parser (tiered) ========================== */
 /**
- * CORS policy.
- *   ALLOWED_ORIGINS = "*"  -> Access-Control-Allow-Origin: * (default; the
- *                             endpoint is open, REQUIRE_KEY defaults to off)
- *   ALLOWED_ORIGINS = "https://a.com,https://b.com" -> echo only listed origins.
- * Origins not on the list receive no ACAO header (browsers block; server-side
- * clients are unaffected).
+ * Layout-resilient parser. Strategy:
+ *   1. Isolate the `<ol id="b_results">` region (avoids head-script noise).
+ *   2. Split it into blocks at SERP-level <li> boundaries (b_algo* keep, b_ad /
+ *      b_ans / b_pag / b_msg are separators → ads & widgets excluded).
+ *   3. For every field, try a chain of independent regex strategies, most
+ *      specific first — Bing markup changes degrade gracefully instead of
+ *      hard-failing. A block survives only if it yields a title AND an http(s) URL.
+ * All regexes are bounded (no unbounded nested quantifiers) to stay ReDoS-safe.
  */
-function corsHeaders(env, request) {
-  const conf = String(env.ALLOWED_ORIGINS || "*").trim();
-  const headers = {
-    "access-control-allow-methods": "POST, OPTIONS",
-    "access-control-allow-headers": "Content-Type",
-    "access-control-max-age": "86400",
+function parseBingSerp(html) {
+  const out = { results: [], totalResults: null, noResultsMarker: false, blockedMarker: false };
+
+  if (typeof html !== 'string' || html.length === 0) return out;
+
+  out.noResultsMarker = /class="[^"]*\bb_no\b[^"]*"/.test(html) || /There are no results for/i.test(html);
+  out.blockedMarker = /b_captcha|\/challenge\/|consent\.bing\.com|microsoftsecurity/i.test(html);
+
+  // total-results: <span class="sb_count">About 50,900 results</span> (locale-safe: keep digits only)
+  const mTot = html.match(/class="[^"]*\bsb_count\b[^"]*"[^>]*>([\s\S]{0,200}?)<\/span>/i);
+  if (mTot) {
+    const digits = mTot[1].replace(/[^0-9]/g, '');
+    if (digits) out.totalResults = parseInt(digits, 10);
+  }
+
+  // 1. results region
+  const startMatch = html.search(/<ol\b[^>]*\bid\s*=\s*"b_results"/i);
+  let serp = html;
+  if (startMatch >= 0) {
+    const ctxStart = html.search(/<ol\b[^>]*\bid\s*=\s*"b_context"/i);
+    serp = html.slice(startMatch, ctxStart > startMatch ? ctxStart : html.length);
+  }
+
+  // 2. SERP-level <li> boundaries
+  const liRe = /<li\b[^>]*>/gi;
+  const marks = [];
+  let m;
+  while ((m = liRe.exec(serp))) {
+    const cls = (m[0].match(/\bclass\s*=\s*"([^"]*)"/i) || [null, ''])[1];
+    const tokens = cls.split(/\s+/);
+    const isAlgo = tokens.some((t) => t === 'b_algo' || t.startsWith('b_algo'));
+    const isBoundary = isAlgo || tokens.some((t) => ['b_ad', 'b_ans', 'b_pag', 'b_msg', 'b_pole'].includes(t));
+    if (isBoundary) marks.push({ end: m.index + m[0].length, isAlgo });
+  }
+
+  // 3. per-block extraction
+  for (let i = 0; i < marks.length; i++) {
+    if (!marks[i].isAlgo) continue;
+    const block = serp.slice(marks[i].end, i + 1 < marks.length ? marks[i + 1].end : serp.length);
+    const r = parseAlgoBlock(block);
+    if (r) out.results.push(r);
+  }
+
+  return out;
+}
+
+function parseAlgoBlock(rawBlock) {
+  // Drop inline <style>/<script> payloads (Bing embeds per-result CSS).
+  const block = rawBlock
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ');
+  if (block.length > 64_000) return null; // sanity cap
+
+  const tu = extractTitleUrl(block);
+  if (!tu || !tu.title || !tu.href) return null;
+
+  const finalUrl = resolveResultUrl(tu.href);
+  if (!finalUrl) return null;
+
+  return {
+    title: tu.title.slice(0, 300),
+    url: finalUrl,
+    favicon: extractFavicon(block),
+    path: extractPath(block, finalUrl),
+    summary: extractSummary(block),
   };
-  if (conf === "*") {
-    headers["access-control-allow-origin"] = "*";
-  } else {
-    const list = conf.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-    const origin = (request?.headers?.get("origin") || "").trim();
-    if (origin && list.includes(origin.toLowerCase())) {
-      headers["access-control-allow-origin"] = origin;
-      headers["vary"] = "Origin";
+}
+
+/** title + href — ordered fallback strategies. */
+function extractTitleUrl(block) {
+  // S1 (current layout): <h2 …><a … href="URL">TITLE</a>
+  let m = block.match(/<h2\b[^>]*>[\s\S]{0,240}?<a\b[^>]*?href="([^"]+)"[^>]*>([\s\S]{0,600}?)<\/a>/i);
+  if (m) return { href: decodeEntities(m[1]), title: cleanText(m[2]) };
+
+  // S2 (attribution variant): the site-card anchor <a class="tilk" href="URL">
+  m = block.match(/<a\b[^>]*\bclass\s*=\s*"[^"]*\btilk\b[^"]*"[^>]*?href="([^"]+)"[^>]*>([\s\S]{0,600}?)<\/a>/i);
+  if (m) {
+    const title = cleanText(block.match(/class="[^"]*\btptt\b[^"]*"[^>]*>([\s\S]{0,200}?)<\/div>/i)?.[1] || m[2]);
+    return { href: decodeEntities(m[1]), title };
+  }
+
+  // S3 (last resort): first http(s) anchor with non-trivial text
+  m = block.match(/<a\b[^>]*?href="((?:https?:\/\/|\/)[^"]+)"[^>]*>([\s\S]{1,400}?)<\/a>/i);
+  if (m) return { href: decodeEntities(m[1]), title: cleanText(m[2]) };
+
+  return null;
+}
+
+/** href → clean absolute http(s) URL; null if unusable. */
+function resolveResultUrl(href) {
+  try {
+    const decoded = decodeBingRedirect(href);
+    const u = new URL(decoded, BING_ORIGIN);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    // Drop internal navigation links (e.g. /search?q=… pagination inside a result card)
+    if (/(^|\.)bing\.com$/i.test(u.hostname) && (/^\/(search|ck)\//i.test(u.pathname) || /^\/ck$/.test(u.pathname))) return null;
+    if (u.toString().length > 2048) return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** summary — ordered fallback strategies. */
+function extractSummary(block) {
+  const candidates = [
+    // S1: <p class="…b_lineclamp…|…b_paractl…">…</p>
+    block.match(/<p\b[^>]*\bclass\s*=\s*"[^"]*(?:b_lineclamp|b_paractl)[^"]*"[^>]*>([\s\S]{0,1500}?)<\/p>/i),
+    // S2: first <p> inside <div class="b_caption">
+    block.match(/<div\b[^>]*\bclass\s*=\s*"[^"]*b_caption[^"]*"[^>]*>[\s\S]{0,300}?<p\b[^>]*>([\s\S]{0,1500}?)<\/p>/i),
+    // S3: any substantial paragraph
+    block.match(/<p\b[^>]*>([\s\S]{20,1500}?)<\/p>/i),
+  ];
+  for (const m of candidates) {
+    if (!m) continue;
+    let s = m[1]
+      .replace(/<span\b[^>]*\bclass\s*=\s*"[^"]*news_dt[^"]*"[^>]*>[\s\S]*?<\/span>/gi, '') // date slug
+      .replace(/<\/(p|div|li)>/gi, ' ');
+    s = cleanText(s, { space: true });
+    s = s.replace(/^Web[A-Z][a-z]{2}\s+\d{1,2},\s*\d{4}\s*[—–-]\s*/, ''); // "WebJun 10, 2025 —" fallback
+    s = s.replace(/^[·•|—–-]\s*/, '').trim();
+    if (s) return s.slice(0, 1200);
+  }
+  return null;
+}
+
+/** breadcrumb path — cite text first, else derived from the final URL. */
+function extractPath(block, finalUrl) {
+  const m = block.match(/<cite\b[^>]*>([\s\S]{0,400}?)<\/cite>/i);
+  if (m) {
+    const c = cleanText(m[1], { space: true });
+    if (c) {
+      const normalized = c
+        .replace(/^https?:\/\//i, '')
+        .replace(/\s*(?:›|»|>)\s*/g, ' > ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (normalized) return normalized.slice(0, 250);
     }
   }
-  return headers;
+  try {
+    const u = new URL(finalUrl);
+    const seg = [u.hostname.replace(/^www\./i, '')];
+    const parts = u.pathname.split('/').filter(Boolean).slice(0, 4);
+    for (const p of parts) {
+      let dec;
+      try { dec = decodeURIComponent(p); } catch { dec = p; }
+      seg.push(dec.replace(/[-_+]/g, ' ').trim());
+    }
+    return seg.join(' > ').slice(0, 250);
+  } catch {
+    return null;
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Authentication (REQUIRE_KEY flag + API_KEYS secret)
-// ---------------------------------------------------------------------------
+/** favicon — from the result markup if absolute; `null` otherwise (handler may fall back). */
+function extractFavicon(block) {
+  // S1: favicon wrapper context: class="…cico…" / "…b_favicon…" / "…wr_fav…" → <img src="…">
+  let m = block.match(/class="[^"]*(?:\bcico\b|\bb_favicon\b|\bwr_fav\b)[^"]*"[^>]*>(?:\s|<a\b[^>]*>|<div\b[^>]*>){0,4}<img\b[^>]*?src="([^"]+)"/i);
+  if (m) return absImgUrl(decodeEntities(m[1]));
+  // S2: Bing thumbnail service with favicon-ish dimensions
+  m = block.match(/<img\b[^>]*?src="(https:\/\/th\.bing\.com\/th\?[^"]*(?:[?&]w=16|[?&]h=16)[^"]*)"/i);
+  if (m) return absImgUrl(decodeEntities(m[1]));
+  return null;
+}
 
-/**
- * Constant-time-ish string comparison: hash both sides with SHA-256 first so
- * the compared byte strings always have equal length, then XOR-accumulate.
- * Works identically on Workers and Node.
- */
-async function safeEqualStrings(a, b) {
-  const subtle = globalThis.crypto?.subtle;
-  const toHex = async (s) => {
-    const digest = await subtle.digest("SHA-256", utf8Encoder.encode(s));
-    return [...new Uint8Array(digest)]
-      .map((x) => x.toString(16).padStart(2, "0"))
-      .join("");
-  };
-  if (subtle) {
-    const [ha, hb] = await Promise.all([toHex(a), toHex(b)]);
-    let diff = 0;
-    for (let i = 0; i < ha.length; i++) diff |= ha.charCodeAt(i) ^ hb.charCodeAt(i);
-    return diff === 0;
+function absImgUrl(src) {
+  try {
+    const u = new URL(src, BING_ORIGIN);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    return u.toString();
+  } catch {
+    return null;
   }
-  // Fallback (should not be reachable on Workers/Node >= 18)
-  const ea = utf8Encoder.encode(a), eb = utf8Encoder.encode(b);
-  if (ea.length !== eb.length) return false;
-  let diff = 0;
-  for (let i = 0; i < ea.length; i++) diff |= ea[i] ^ eb[i];
+}
+
+/* ======================== streaming cursor (stateless) ==================== */
+/**
+ * stream-id = base64url({ q, l, f, n, s, r }) — a self-contained, stateless
+ * pagination cursor (survives isolate restarts / multi-isolate routing, no
+ * server memory, no TTL). r = next rank, s = next Bing `first`, n = requested
+ * total, l = lang, f = favicon flag, q = query.
+ */
+function encodeCursor(state) {
+  return b64UrlEncodeStr(JSON.stringify(state));
+}
+
+function makeCursor(p) {
+  return { q: p.query, l: p.lang, f: p.favicon ? 1 : 0, n: p.results, s: 1, r: 1 };
+}
+
+function decodeCursor(id) {
+  let parsed;
+  try {
+    if (typeof id !== 'string' || !id || id.length > 2000 || !STREAM_ID_RE.test(id)) throw 0;
+    parsed = JSON.parse(b64UrlDecode(id));
+  } catch {
+    throw new ApiError(400, 'INVALID_STREAM_ID', 'VALIDATION', 'The provided stream-id is malformed or expired.');
+  }
+  const ok =
+    parsed && typeof parsed === 'object' &&
+    typeof parsed.q === 'string' && parsed.q.length >= 1 && parsed.q.length <= MAX_QUERY_CHARS &&
+    (parsed.l === '' || (typeof parsed.l === 'string' && LANG_RE.test(parsed.l))) &&
+    (parsed.f === 0 || parsed.f === 1) &&
+    Number.isInteger(parsed.n) && parsed.n >= RESULTS_MIN && parsed.n <= RESULTS_MAX &&
+    Number.isInteger(parsed.s) && parsed.s >= 1 && parsed.s <= BING_FIRST_MAX &&
+    Number.isInteger(parsed.r) && parsed.r >= 1 && parsed.r <= 1000;
+  if (!ok) throw new ApiError(400, 'INVALID_STREAM_ID', 'VALIDATION', 'The provided stream-id is malformed or expired.');
+  return parsed;
+}
+
+/* ============================ payload validation ========================== */
+
+function asBool(v, field) {
+  if (typeof v === 'boolean') return v;
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  throw new ApiError(400, `INVALID_${field.toUpperCase().replace(/-/g, '_')}`, 'VALIDATION', `Field "${field}" must be a boolean.`);
+}
+
+function validatePayload(body, env) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ApiError(400, 'INVALID_PAYLOAD', 'VALIDATION', 'Request body must be a JSON object.');
+  }
+
+  // query (required)
+  const query = typeof body.query === 'string' ? body.query.trim() : body.query;
+  if (typeof query !== 'string' || query.length === 0) {
+    throw new ApiError(400, 'QUERY_REQUIRED', 'VALIDATION', 'Field "query" is required and must be a non-empty string.');
+  }
+  if (query.length > MAX_QUERY_CHARS) {
+    throw new ApiError(400, 'QUERY_TOO_LONG', 'VALIDATION', `Field "query" must be at most ${MAX_QUERY_CHARS} characters.`);
+  }
+
+  // results (required, integer 1..100; integer-valued strings tolerated)
+  let results = body.results;
+  if (typeof results === 'string' && /^-?\d+$/.test(results.trim())) results = parseInt(results.trim(), 10);
+  if (typeof results !== 'number' || !Number.isInteger(results)) {
+    throw new ApiError(400, 'INVALID_RESULTS', 'VALIDATION', 'Field "results" must be an integer between 1 and 100.');
+  }
+  if (results < RESULTS_MIN || results > RESULTS_MAX) {
+    throw new ApiError(400, 'RESULTS_OUT_OF_RANGE', 'VALIDATION', 'Field "results" must be between 1 and 100.');
+  }
+
+  // is-stream (required)
+  const isStream = asBool(body['is-stream'], 'is-stream');
+
+  // show-telemetry (optional, default false)
+  const showTelemetry = body['show-telemetry'] === undefined ? false : asBool(body['show-telemetry'], 'show-telemetry');
+
+  // favicon (optional, default false)
+  const favicon = body.favicon === undefined ? false : asBool(body.favicon, 'favicon');
+
+  // lang (optional, default env DEFAULT_LANG → "en-US")
+  let lang = body.lang === undefined ? (env && env.DEFAULT_LANG) || 'en-US' : body.lang;
+  if (typeof lang !== 'string' || !LANG_RE.test(lang.trim())) {
+    throw new ApiError(400, 'INVALID_LANG', 'VALIDATION', 'Field "lang" must be an RFC-1766-style code like "en" or "en-US".');
+  }
+  lang = normalizeLang(lang.trim());
+
+  // key (optional)
+  let key = body.key === undefined || body.key === null ? null : body.key;
+  if (key !== null) {
+    if (typeof key !== 'string') throw new ApiError(400, 'INVALID_KEY', 'VALIDATION', 'Field "key" must be a string.');
+    key = key.trim().slice(0, 256);
+    if (key === '') key = null;
+  }
+
+  // stream-id (optional; required for stream continuation)
+  let streamId = body['stream-id'] === undefined || body['stream-id'] === null ? null : body['stream-id'];
+  if (streamId !== null) {
+    if (typeof streamId !== 'string' || streamId.length > 2000) {
+      throw new ApiError(400, 'INVALID_STREAM_ID', 'VALIDATION', 'Field "stream-id" must be a string of at most 2000 characters.');
+    }
+    streamId = streamId.trim();
+  }
+
+  return { query, results, isStream, showTelemetry, favicon, lang, key, streamId };
+}
+
+function normalizeLang(lang) {
+  const [primary, ...rest] = lang.split('-');
+  if (!rest.length) return primary.toLowerCase();
+  const region = rest.join('-');
+  return `${primary.toLowerCase()}-${region.length === 2 ? region.toUpperCase() : region.charAt(0).toUpperCase() + region.slice(1)}`;
+}
+
+/* ================================ auth ==================================== */
+
+function collectKeys(env) {
+  const keys = [];
+  for (const name of Object.keys(env || {})) {
+    if (/^KEY-\d+$/.test(name)) {
+      const v = env[name];
+      if (typeof v === 'string' && v.length > 0) keys.push(v);
+    }
+  }
+  return keys;
+}
+
+/** Constant-time-ish comparison (only length is leaked — acceptable for API keys). */
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ea = new TextEncoder().encode(a);
+  const eb = new TextEncoder().encode(b);
+  let diff = ea.length ^ eb.length;
+  const n = Math.max(ea.length, eb.length);
+  for (let i = 0; i < n; i++) diff |= (ea[i] || 0) ^ (eb[i] || 0);
   return diff === 0;
 }
 
 /**
- * Enforce authentication when REQUIRE_KEY is truthy ("true"/"1" — wrangler
- * [vars] are strings). Keys live in the API_KEYS secret, comma-separated:
- *   wrangler secret put API_KEYS     ->  "alpha-key,beta-key"
+ * REQUIRE_KEY="false" (default) → every request authorized; `key` is ignored.
+ * REQUIRE_KEY="true" → `key` must match one of the KEY-1..KEY-n secrets.
  */
-async function checkAuth(env, key) {
-  if (!isTruthy(env.REQUIRE_KEY)) return; // open endpoint (default)
-  const validKeys = String(env.API_KEYS || "")
-    .split(",").map((s) => s.trim()).filter(Boolean);
-  if (validKeys.length === 0) {
-    throw new HttpError(
-      500, "server_misconfigured",
-      "REQUIRE_KEY is enabled but no API_KEYS secret is configured. Run: wrangler secret put API_KEYS"
-    );
+function authorize(env, key) {
+  if (!requireKeyFlag(env)) return;
+  const keys = collectKeys(env);
+  if (keys.length === 0) {
+    throw new ApiError(500, 'CONFIG_ERROR', 'CONFIG', 'REQUIRE_KEY is enabled but no KEY-n secrets are configured. Run: wrangler secret put KEY-1');
   }
   if (!key) {
-    throw new HttpError(401, "unauthorized",
-      "Missing API key. Provide it in the 'key' field of the JSON request body.");
+    throw new ApiError(401, 'MISSING_KEY', 'AUTH', 'This deployment requires a key. Send it as "key" in the JSON request body.');
   }
-  let ok = false;
-  for (const candidate of validKeys) {
-    if (await safeEqualStrings(candidate, key)) { ok = true; break; }
-  }
-  if (!ok) throw new HttpError(401, "unauthorized", "Invalid API key.");
-}
-
-// ---------------------------------------------------------------------------
-// Optional per-isolate rate limiting (disabled by default: RATE_LIMIT_PER_MINUTE=0)
-// ---------------------------------------------------------------------------
-
-const rateBuckets = new Map(); // clientIp -> { windowStart, count }
-
-function checkRateLimit(env, request) {
-  const perMinute = intVal(env.RATE_LIMIT_PER_MINUTE, 0);
-  if (perMinute <= 0) return;
-  const ip = (request.headers.get("cf-connecting-ip") || "unknown").slice(0, 64);
-  const windowMs = 60_000;
-  const now = nowMs();
-  let bucket = rateBuckets.get(ip);
-  if (!bucket || now - bucket.windowStart >= windowMs) {
-    bucket = { windowStart: now, count: 0 };
-  }
-  bucket.count += 1;
-  rateBuckets.set(ip, bucket);
-  if (rateBuckets.size > 10_000) { // crude memory guard: evict expired buckets
-    for (const [k, v] of rateBuckets) {
-      if (now - v.windowStart >= windowMs) rateBuckets.delete(k);
-    }
-  }
-  if (bucket.count > perMinute) {
-    throw new HttpError(429, "rate_limited",
-      `Rate limit exceeded (${perMinute} requests/minute). Retry shortly.`);
+  if (!keys.some((k) => timingSafeEqual(k, key))) {
+    throw new ApiError(401, 'INVALID_KEY', 'AUTH', 'The provided key is not valid.');
   }
 }
 
-// ---------------------------------------------------------------------------
-// Concurrency queue — at most BING_MAX_CONCURRENCY (6) in-flight Bing GETs
-// ---------------------------------------------------------------------------
+/* ======================= Bing request construction ======================== */
 
 /**
- * FIFO semaphore. `acquire()` resolves as soon as a slot is free; requests
- * beyond the limit wait in strict arrival order. Waiters can be cancelled:
- *   - parentSignal aborted  (client disconnected)  -> rejects AbortError
- *   - timeoutMs elapsed                          -> rejects HttpError(504, queue_timeout)
- * A released slot is handed directly to the head of the queue (no lock convoys).
+ * Always: https://www.bing.com/search?q=<encoded>&webscp=1
+ * plus count/first for pagination and setmkt/setlang for localization.
  */
-class FairSemaphore {
-  constructor(limit) {
-    if (!Number.isInteger(limit) || limit < 1) {
-      throw new Error(`FairSemaphore: limit must be a positive integer, got ${limit}`);
-    }
-    this.limit = limit;
-    this.active = 0;
-    this.waiters = [];
-  }
-
-  depth() {
-    return this.waiters.length;
-  }
-
-  acquire(parentSignal, timeoutMs) {
-    if (this.active < this.limit) {
-      this.active += 1;
-      return Promise.resolve(this._makeHandle());
-    }
-    return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, done: false, timer: null, onAbort: null, parentSignal: parentSignal || null };
-      const settle = (fn, value) => {
-        if (waiter.done) return;
-        waiter.done = true;
-        if (waiter.timer) clearTimeout(waiter.timer);
-        if (waiter.onAbort && parentSignal) {
-          parentSignal.removeEventListener("abort", waiter.onAbort);
-        }
-        fn(value);
-      };
-      if (timeoutMs > 0) {
-        waiter.timer = setTimeout(() => {
-          const idx = this.waiters.indexOf(waiter);
-          if (idx >= 0) this.waiters.splice(idx, 1);
-          settle(reject, new HttpError(
-            504, "queue_timeout",
-            `Search queue is at capacity (${this.limit} concurrent upstream requests). Retry shortly.`
-          ));
-        }, timeoutMs);
-      }
-      if (parentSignal) {
-        waiter.onAbort = () => {
-          const idx = this.waiters.indexOf(waiter);
-          if (idx >= 0) this.waiters.splice(idx, 1);
-          const err = new Error("Client aborted while queued");
-          err.name = "AbortError";
-          settle(reject, err);
-        };
-        if (parentSignal.aborted) { waiter.onAbort(); return; }
-        parentSignal.addEventListener("abort", waiter.onAbort, { once: true });
-      }
-      this.waiters.push(waiter);
-    });
-  }
-
-  _detachWaiter(waiter) {
-    if (waiter.timer) clearTimeout(waiter.timer);
-    if (waiter.onAbort && waiter.parentSignal) {
-      waiter.parentSignal.removeEventListener("abort", waiter.onAbort);
-    }
-    waiter.onAbort = null;
-  }
-
-  _makeHandle() {
-    let released = false;
-    return {
-      release: () => {
-        if (released) return;
-        released = true;
-        this._release();
-      },
-    };
-  }
-
-  _release() {
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      if (waiter.done) { this._release(); return; } // stale waiter (raced abort)
-      waiter.done = true;
-      this._detachWaiter(waiter);
-      waiter.resolve(this._makeHandle()); // hand the slot straight over
-      return;
-    }
-    this.active = Math.max(0, this.active - 1);
-  }
-}
-
-/** One semaphore per configured limit (module scope = per-isolate lifetime). */
-const limiterRegistry = new Map();
-
-function getLimiter(limit) {
-  const n = Math.max(1, Math.min(64, limit));
-  let sem = limiterRegistry.get(n);
-  if (!sem) {
-    sem = new FairSemaphore(n);
-    limiterRegistry.set(n, sem);
-  }
-  return sem;
-}
-
-// ---------------------------------------------------------------------------
-// Bing request construction (URL + clean outbound headers)
-// ---------------------------------------------------------------------------
-
-function langToMkt(lang) {
-  if (!lang) return null;
-  if (/-/.test(lang)) return lang; // already market-shaped, e.g. "pt-BR"
-  return LANG_TO_MKT[lang.toLowerCase()] || null;
-}
-
-function toAcceptLanguage(lang) {
-  if (!lang) return "en-US,en;q=0.9";
-  const mkt = langToMkt(lang);
-  const primary = lang.split("-")[0].toLowerCase();
-  return mkt ? `${mkt},${primary};q=0.9,en;q=0.5` : `${lang},${primary};q=0.9,en;q=0.5`;
-}
-
-/**
- * Build the upstream Bing SERP URL.
- *   https://www.bing.com/search?q={encoded query}&webscp=1[&setlang=..&mkt=..][&first=N]
- * `webscp=1` is ALWAYS appended (hard requirement of this spec).
- * `first` is the 1-based offset used for pagination when result_number > page size.
- */
-function buildBingUrl(query, { lang, first } = {}) {
+function buildBingUrl({ query, count, first = 1, lang = 'en-US' }) {
   const u = new URL(BING_ORIGIN + BING_SEARCH_PATH);
-  u.searchParams.set("q", query);
-  u.searchParams.set("webscp", "1");
-  if (lang) {
-    u.searchParams.set("setlang", lang);
-    const mkt = langToMkt(lang);
-    if (mkt) u.searchParams.set("mkt", mkt);
-  }
-  if (Number.isInteger(first) && first > 1) u.searchParams.set("first", String(first));
+  u.searchParams.set('q', query);
+  u.searchParams.set('webscp', '1'); // ← unconditionally appended (spec invariant)
+  if (Number.isInteger(count) && count > 0) u.searchParams.set('count', String(Math.min(count, PAGE_SIZE_MAX)));
+  if (Number.isInteger(first) && first > 1) u.searchParams.set('first', String(first));
+  const [primary, region] = lang.split('-');
+  if (region) u.searchParams.set('setmkt', lang);
+  if (primary) u.searchParams.set('setlang', primary);
   return u.toString();
 }
 
-/**
- * Build the clean outbound header map. Built from scratch from an allowlist —
- * inbound proxy headers are stripped by construction. A defensive assertion
- * guarantees no forbidden header sneaks in.
- */
-function buildBingHeaders(lang) {
-  const headers = {
-    ...OUTBOUND_HEADER_ALLOWLIST,
-    "accept-language": toAcceptLanguage(lang),
-    referer: BING_ORIGIN + "/",
-  };
-  for (const key of Object.keys(headers)) {
-    if (FORBIDDEN_OUTBOUND.includes(key)) {
-      throw new Error(`Refusing to send forbidden upstream header: ${key}`);
-    }
-  }
+/** Remove every proxy/CF header from a Headers object (mutates + returns it). */
+function scrubProxyHeaders(headers) {
+  for (const name of STRIP_OUTBOUND_HEADERS) headers.delete(name);
   return headers;
 }
 
-// ---------------------------------------------------------------------------
-// Upstream client (slot acquisition + timeout + one retry)
-// ---------------------------------------------------------------------------
+/** Fresh, browser-like outbound headers. Nothing from the client is forwarded. */
+function buildOutboundHeaders(lang = 'en-US') {
+  const h = new Headers();
+  h.set('User-Agent', USER_AGENT);
+  h.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8');
+  h.set('Accept-Language', acceptLanguageValue(lang));
+  h.set('Referer', BING_ORIGIN + '/');
+  h.set('Cache-Control', 'no-cache');
+  h.set('Pragma', 'no-cache');
+  h.set('Upgrade-Insecure-Requests', '1');
+  // NOTE: Accept-Encoding intentionally omitted — the runtime negotiates and
+  // transparently decompresses. Defense-in-depth: scrub once more below.
+  return scrubProxyHeaders(h);
+}
 
-/**
- * Fetch one Bing SERP page through the concurrency semaphore.
- * Returns { html, status, queueMs }.
- * Throws HttpError: 504 upstream_timeout | 502 upstream_error | 502 upstream_empty
- * (plus queue_timeout / AbortError propagated from acquire()).
- */
-async function fetchBingPage(url, headers, parentSignal, env, limiter) {
-  const fetchTimeoutMs = intVal(env.BING_FETCH_TIMEOUT_MS, 8000);
-  const queueTimeoutMs = intVal(env.QUEUE_WAIT_TIMEOUT_MS, 10000);
-  let attempt = 0;
+function acceptLanguageValue(lang) {
+  const primary = lang.split('-')[0].toLowerCase();
+  const parts = [lang];
+  if (primary !== lang.toLowerCase()) parts.push(`${primary};q=0.9`);
+  parts.push('en;q=0.5');
+  return parts.join(',');
+}
 
-  for (;;) {
-    attempt += 1;
-    const tAcquire = nowMs();
-    const slot = await limiter.acquire(parentSignal, queueTimeoutMs);
-    const queueMs = nowMs() - tAcquire;
-    const tFetch = nowMs();
-    let response;
+/* ============================ fetch pipeline ============================== */
+
+async function fetchBingViaQueue(url, lang, timings, env) {
+  const queueWaitMs = clampInt(env && env.QUEUE_WAIT_MS, 10, 120_000, DEFAULT_QUEUE_WAIT_MS);
+  const timeoutMs = clampInt(env && env.UPSTREAM_TIMEOUT_MS, 100, 120_000, DEFAULT_UPSTREAM_TIMEOUT_MS);
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= UPSTREAM_RETRIES; attempt++) {
+    let slot;
     try {
-      const controller = new AbortController();
-      let timedOut = false;
-      const timer = setTimeout(() => { timedOut = true; controller.abort(); }, fetchTimeoutMs);
-      let onParentAbort = null;
-      if (parentSignal) {
-        if (parentSignal.aborted) controller.abort();
-        else {
-          onParentAbort = () => controller.abort();
-          parentSignal.addEventListener("abort", onParentAbort, { once: true });
-        }
-      }
-      try {
-        response = await fetch(url, {
-          method: "GET",
-          headers,
-          redirect: "follow",
-          cache: "no-store",
-          signal: controller.signal,
-        });
-        if (response.ok) {
-          const html = await response.text();
-          if (!html || html.length < 200) {
-            throw new HttpError(502, "upstream_empty",
-              "Bing returned an empty or truncated response body.");
-          }
-          return {
-            html,
-            status: response.status,
-            queueMs,
-            fetchMs: nowMs() - tFetch,
-          };
-        }
-      } catch (err) {
-        if (err instanceof HttpError) throw err;
-        if (timedOut) {
-          throw new HttpError(504, "upstream_timeout",
-            `Bing request timed out after ${fetchTimeoutMs}ms.`);
-        }
-        throw err; // parent abort (client gone) or network error
-      } finally {
-        clearTimeout(timer);
-        if (onParentAbort && parentSignal) {
-          parentSignal.removeEventListener("abort", onParentAbort);
-        }
-      }
-      // Non-OK upstream status: retryable statuses fall through to the
-      // backoff sleep below (the slot is already released by then, so the
-      // queue keeps flowing); everything else fails fast.
-      const status = response.status;
-      if (!(LIMITS.retryStatuses.includes(status) && attempt < LIMITS.maxFetchAttempts)) {
-        throw new HttpError(502, "upstream_error",
-          `Bing responded with HTTP ${status}.`, { upstream_status: status });
-      }
-    } finally {
-      slot.release();
+      slot = await bingQueue.acquire(queueWaitMs); // throws ApiError 503 on timeout
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw new ApiError(503, 'QUEUE_TIMEOUT', 'OVERLOADED', 'Bing request queue wait exceeded.');
     }
-    await sleep(200 * attempt); // small backoff, then re-acquire a slot
-    continue;
+    timings.que += slot.waitedMs;
+
+    const t = now();
+    try {
+      return await timedFetchText(url, buildOutboundHeaders(lang), timeoutMs);
+    } catch (e) {
+      lastErr = e;
+      const retryable = e instanceof ApiError && e.status === 502;
+      if (retryable && attempt < UPSTREAM_RETRIES) {
+        await sleep(RETRY_DELAY_MS);
+        continue;
+      }
+      throw e;
+    } finally {
+      timings.fetch += now() - t; // includes queue→fetch wall time of this attempt only
+      bingQueue.release();        // ← ALWAYS released, even on error (no slot leaks)
+    }
+  }
+  throw lastErr || new ApiError(502, 'FETCH_FAILED', 'FETCH', 'Bing request failed.');
+}
+
+async function timedFetchText(url, headers, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    // NOTE: globalThis.fetch is REQUIRED — a bare `fetch(...)` would resolve to
+    // this module's own handler function (shadowing) and recurse into the worker.
+    res = await globalThis.fetch(url, { method: 'GET', headers, redirect: 'follow', signal: controller.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    const code = controller.signal.aborted ? 'UPSTREAM_TIMEOUT' : 'FETCH_FAILED';
+    throw new ApiError(502, code, 'FETCH', `Could not fetch Bing results (${code}): ${safeMsg(e)}`);
+  }
+  try {
+    if (!res.ok) {
+      const code = res.status === 429 ? 'UPSTREAM_RATE_LIMITED' : 'UPSTREAM_ERROR';
+      throw new ApiError(502, code, 'FETCH', `Bing responded with HTTP ${res.status}.`);
+    }
+    const html = await res.text();
+    return html;
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(502, 'FETCH_FAILED', 'FETCH', `Could not read Bing response: ${safeMsg(e)}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// ---------------------------------------------------------------------------
-// SERP parser — layout-resilient, tiered strategies
-// ---------------------------------------------------------------------------
+function clampInt(v, min, max, dflt) {
+  const n = parseInt(String(v ?? ''), 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
 
-const RE_STYLE_BLOCK = /<style\b[^>]*>[\s\S]*?<\/style>/gi;
-const RE_RESULTS_CONTAINER = /<(?:ol|ul|div)\b[^>]*(?:id="b_results"|class="[^"]*\bb_results\b[^"]*")/i;
-const RE_NO_RESULTS = /class="[^"]*\bb_no\b[^"]*"/;
-const RE_CONSENT_WALL = /clkconsent|consent\.bing\.com/i;
+/* ============================ grade + telemetry =========================== */
 
-/** "About 50,900 results" / "50.900 Ergebnisse" -> 50900 (longest digit run wins). */
-function parseTotalResults(html) {
-  const m = /<[a-z0-9]+\b[^>]*\bclass="[^"]*\bsb_count\b[^"]*"[^>]*>([\s\S]{0,300}?)<\//i
-    .exec(html);
-  if (!m) return null;
-  const text = decodeEntities(m[1]).replace(/\u00A0/g, " ");
-  const groups = text.match(/\d[\d.,\s\u00A0]*/g);
-  if (!groups) return null;
-  let best = "";
-  for (const g of groups) {
-    if (g.replace(/\D/g, "").length > best.replace(/\D/g, "").length) best = g;
+function gradeFromMs(ms) {
+  for (const [threshold, grade] of GRADE_TABLE) if (ms <= threshold) return grade;
+  return 'F';
+}
+
+function buildTelemetry(timings, totalMs, pingMs) {
+  const t = {
+    'que-time': round1(timings.que),
+    'in-flight': round1(timings.fetch),
+    'parse-time': round1(timings.parse),
+    'total-time': round1(totalMs),
+    'time-grade': gradeFromMs(totalMs),
+  };
+  if (typeof pingMs === 'number' && Number.isFinite(pingMs)) {
+    t.ping = round1(pingMs); // one-way estimate; clock skew clamped at 0, sane ceiling 10 min
   }
-  const n = parseInt(best.replace(/\D/g, ""), 10);
-  return Number.isFinite(n) ? n : null;
+  return t;
 }
 
-/** Snippet extraction: paragraphs with known snippet classes first, then longest paragraph. */
-function parseSnippet(blockBody) {
-  const paragraphs = [...blockBody.matchAll(/<p\b([^>]*)>([\s\S]{0,2500}?)<\/p>/gi)]
-    .map((m) => ({ attrs: m[1], text: stripTags(m[2]) }))
-    .filter((p) => p.text.length >= 10);
-  if (paragraphs.length === 0) return "";
-  for (const marker of ["b_algoSlug", "b_paractr", "b_snippet", "b_lineclamp"]) {
-    const hit = paragraphs.find((p) =>
-      new RegExp(`\\b${marker}\\b`).test(p.attrs));
-    if (hit) return hit.text;
+/** Parse X-Client-Sent-At defensively (Number(null) === 0 would fake a ping!). */
+function parseClientSentAt(request) {
+  const raw = request.headers.get('x-client-sent-at');
+  if (raw === null) return null;
+  const s = String(raw).trim();
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
+  return Number(s);
+}
+
+function pingMsFrom(receivedAt, clientSentAt) {
+  if (clientSentAt === null) return null;
+  return Math.min(600_000, Math.max(0, receivedAt - clientSentAt));
+}
+
+/* ============================== CORS helpers ============================== */
+
+function corsHeaders(env, request) {
+  const conf = String((env && env.CORS_ORIGIN) || '*').trim();
+  const h = new Headers();
+  const origin = request && request.headers ? request.headers.get('origin') : null;
+  if (conf === '*') {
+    h.set('Access-Control-Allow-Origin', '*');
+  } else {
+    const list = conf.split(',').map((s) => s.trim()).filter(Boolean);
+    if (origin && list.includes(origin)) {
+      h.set('Access-Control-Allow-Origin', origin);
+      h.set('Vary', 'Origin');
+    }
   }
-  const pool = paragraphs.filter((p) => !/\bb_factrow\b|\bb_attribution\b/.test(p.attrs));
-  const candidates = pool.length ? pool : paragraphs;
-  return candidates.reduce((a, b) => (b.text.length > a.text.length ? b : a)).text;
+  h.set('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  h.set('Access-Control-Expose-Headers', CORS_EXPOSE_HEADERS.join(', '));
+  return h;
 }
 
-/** Favicon: img.rms_img / div.cico img from Bing markup, else DuckDuckGo icon service. */
-function parseFavicon(blockBody, fallbackHost) {
-  const imgTag =
-    /<img\b[^>]*\bclass="[^"]*\brms_img\b[^"]*"[^>]*>/i.exec(blockBody)?.[0] ||
-    /class="[^"]*\bcico\b[^"]*"[^>]*>\s*<img\b[^>]*>/i.exec(blockBody)?.[0];
-  let src = imgTag
-    ? (attrValue(imgTag, "src") || attrValue(imgTag, "data-src"))
-    : null;
-  if (src) {
-    src = decodeEntities(src).trim();
-    if (/^https?:\/\//i.test(src)) return src;
-    if (src.startsWith("/")) return BING_ORIGIN + src;
+function applyCors(headers, env, request) {
+  for (const [k, v] of corsHeaders(env, request).entries()) headers.set(k, v);
+  return headers;
+}
+
+/* ============================ response helpers ============================ */
+
+function jsonResponse(request, env, requestId, data, { status = 200, extra = null } = {}) {
+  const h = new Headers();
+  h.set('Content-Type', 'application/json; charset=utf-8');
+  h.set('Cache-Control', 'no-store');
+  h.set('X-Request-Id', requestId);
+  if (extra) for (const [k, v] of extra.entries()) h.set(k, v);
+  applyCors(h, env, request);
+  return new Response(JSON.stringify(data), { status, headers: h });
+}
+
+function errorResponse(request, env, requestId, err) {
+  const h = new Headers();
+  h.set('Content-Type', 'application/json; charset=utf-8');
+  h.set('Cache-Control', 'no-store');
+  h.set('X-Request-Id', requestId);
+  h.set('X-Error-Code', err.code || 'INTERNAL_ERROR');
+  h.set('X-Failure-Reason', err.reason || 'INTERNAL');
+  if (err.status === 429 && err.retryAfterSec) h.set('Retry-After', String(err.retryAfterSec));
+  applyCors(h, env, request);
+  const body = { error: err.code || 'INTERNAL_ERROR', message: err.message || 'Unexpected error.' };
+  return new Response(JSON.stringify(body), { status: err.status || 500, headers: h });
+}
+
+/* ================================ router ================================== */
+
+function normalizePath(pathname) {
+  let p = pathname.replace(/\/+$/, '');
+  return p === '' ? '/' : p;
+}
+
+async function route(request, env, requestId) {
+  const url = new URL(request.url);
+  const path = normalizePath(url.pathname);
+
+  if (request.method === 'OPTIONS') return preflight(request, env);
+
+  if (path === '/' || path === '/health') {
+    if (request.method === 'GET') return infoResponse(request, env, requestId);
+    return methodNotAllowed(request, env, requestId, 'GET, OPTIONS');
   }
-  return `https://icons.duckduckgo.com/ip3/${fallbackHost}.ico`;
+
+  if (path === '/api/v1' || path === '/api/v1/search' || path === '/search') {
+    if (request.method === 'POST') return handleSearch(request, env, requestId);
+    if (request.method === 'GET' && path === '/api/v1') return infoResponse(request, env, requestId);
+    return methodNotAllowed(request, env, requestId, 'POST, GET, OPTIONS');
+  }
+
+  if (path === '/api/v1/key-status') {
+    if (request.method === 'GET') {
+      return jsonResponse(request, env, requestId, {
+        name: 'free-serp-api',
+        version: VERSION,
+        'key-required': requireKeyFlag(env),
+      });
+    }
+    return methodNotAllowed(request, env, requestId, 'GET, OPTIONS');
+  }
+
+  if (path === '/demo') {
+    if (request.method === 'GET') return demoPage(request, env, requestId);
+    return methodNotAllowed(request, env, requestId, 'GET, OPTIONS');
+  }
+
+  throw new ApiError(404, 'NOT_FOUND', 'ROUTING', `No route for ${request.method} ${path}. Use POST /api/v1/.`);
 }
 
-function safeHost(url) {
-  try { return new URL(url).hostname.toLowerCase(); } catch { return null; }
+function methodNotAllowed(request, env, requestId, allow) {
+  const err = new ApiError(405, 'METHOD_NOT_ALLOWED', 'ROUTING', `Method ${request.method} is not allowed here. Allowed: ${allow}.`);
+  err.allow = allow;
+  const res = errorResponse(request, env, requestId, err);
+  const h = new Headers(res.headers);
+  h.set('Allow', allow);
+  return new Response(res.body, { status: res.status, headers: h });
 }
 
-/** Dedup key: host (www-stripped) + path (trailing-slash-stripped) + query. */
-function normalizeUrlKey(url) {
+function preflight(request, env) {
+  const h = corsHeaders(env, request);
+  const reqMethod = (request.headers.get('access-control-request-method') || '').toUpperCase();
+  if (reqMethod && reqMethod !== 'POST' && reqMethod !== 'GET' && reqMethod !== 'OPTIONS') {
+    return new Response(null, { status: 403, headers: h });
+  }
+  const requested = (request.headers.get('access-control-request-headers') || '')
+    .toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
+  if (requested.some((x) => !CORS_ALLOW_HEADERS.includes(x))) {
+    return new Response(null, { status: 403, headers: h });
+  }
+  h.set('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS.join(', '));
+  h.set('Access-Control-Max-Age', '86400');
+  return new Response(null, { status: 204, headers: h });
+}
+
+function infoResponse(request, env, requestId) {
+  const limit = parseRateLimit(env && env.RATE_LIMIT);
+  return jsonResponse(request, env, requestId, {
+    name: 'free-serp-api',
+    version: VERSION,
+    status: 'ok',
+    'key-required': requireKeyFlag(env),
+    'rate-limit-per-minute': limit > 0 ? limit : null,
+    'rate-limit-unlimited': limit <= 0,
+    endpoints: {
+      search: 'POST /api/v1/',
+      search_alias: 'POST /api/v1/search (also POST /search)',
+      info: 'GET /api/v1/',
+      key_status: 'GET /api/v1/key-status',
+      demo: 'GET /demo',
+    },
+  });
+}
+
+/* eslint-disable no-unused-vars */
+const DEMO_PAGE = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>free-serp-api demo</title>
+<style>body{font:14px/1.5 system-ui,sans-serif;margin:2rem auto;max-width:56rem;padding:0 1rem;color:#222}
+input{padding:.45rem .6rem;font:inherit;width:24rem}button{padding:.45rem 1rem;font:inherit;cursor:pointer}
+pre{background:#f4f4f5;padding:1rem;border-radius:8px;overflow:auto;max-height:24rem}
+code{background:#f4f4f5;padding:.1rem .3rem;border-radius:4px}</style></head>
+<body><h3 style="font-weight:600">free-serp-api — live test</h3>
+<p><input id="q" value="quantum computing"> <button id="go">Search → POST /api/v1/</button></p>
+<p>Open DevTools (F12) — the full JSON response and a <code>console.table</code> of results are printed there. Raw JSON also shown below.</p>
+<pre id="out">waiting for search…</pre>
+<script>
+(function () {
+  var ENDPOINT = new URL('/api/v1/', location.href).href;
+  document.getElementById('go').onclick = function () {
+    var q = document.getElementById('q').value || 'quantum computing';
+    fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 'is-stream': false, query: q, results: 10, 'show-telemetry': true })
+    })
+      .then(function (r) { return r.json().then(function (d) { return { status: r.status, d: d }; }); })
+      .then(function (x) {
+        console.log('[free-serp-api] HTTP ' + x.status + ' response:', x.d);
+        if (x.d && x.d.results) {
+          console.table(x.d.results.map(function (r) { return { rank: r.rank, title: r.title, url: r.url }; }));
+        }
+        document.getElementById('out').textContent = JSON.stringify(x.d, null, 2);
+      })
+      .catch(function (e) {
+        console.error('[free-serp-api] request failed:', e);
+        document.getElementById('out').textContent = String(e);
+      });
+  };
+  document.getElementById('go').click();
+})();
+</script></body></html>`;
+/* eslint-enable no-unused-vars */
+
+function demoPage(request, env, requestId) {
+  const h = new Headers();
+  h.set('Content-Type', 'text/html; charset=utf-8');
+  h.set('Cache-Control', 'no-store');
+  h.set('X-Request-Id', requestId);
+  applyCors(h, env, request);
+  return new Response(DEMO_PAGE, { status: 200, headers: h });
+}
+
+/* ============================ search handler ============================== */
+
+async function handleSearch(request, env, requestId) {
+  const t0 = now();
+  const pingMs = pingMsFrom(t0, parseClientSentAt(request));
+
+  // 1) Rate limiting (cheapest DoS guard, keyed per client IP, before body parsing)
+  const limit = parseRateLimit(env && env.RATE_LIMIT);
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const rl = rateCheck(ip, limit);
+  if (!rl.allowed) {
+    const retryAfterSec = Math.max(1, Math.ceil(rl.retryAfterMs / 1000));
+    const err = new ApiError(429, 'RATE_LIMITED', 'RATE_LIMIT', `Rate limit exceeded: max ${limit} requests/minute per client. Retry after ${retryAfterSec}s.`);
+    err.retryAfterSec = retryAfterSec;
+    throw err;
+  }
+
+  // 2) Body + content type
+  const declaredLength = parseInt(request.headers.get('content-length') || '0', 10);
+  if (declaredLength > MAX_BODY_BYTES) {
+    throw new ApiError(413, 'PAYLOAD_TOO_LARGE', 'VALIDATION', `Request body exceeds ${MAX_BODY_BYTES} bytes.`);
+  }
+  const contentType = (request.headers.get('content-type') || '').toLowerCase();
+  if (contentType && !contentType.includes('application/json')) {
+    throw new ApiError(415, 'UNSUPPORTED_MEDIA_TYPE', 'VALIDATION', 'Content-Type must be application/json.');
+  }
+  const raw = await request.text();
+  if (raw.length > MAX_BODY_BYTES) {
+    throw new ApiError(413, 'PAYLOAD_TOO_LARGE', 'VALIDATION', `Request body exceeds ${MAX_BODY_BYTES} bytes.`);
+  }
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    throw new ApiError(400, 'INVALID_JSON', 'VALIDATION', 'Request body is not valid JSON.');
+  }
+
+  // 3) Payload + auth
+  const p = validatePayload(body, env);
+  authorize(env, p.key);
+
+  // 4) Plan: stateless cursor for streams, page-stitching otherwise
+  const timings = { que: 0, fetch: 0, parse: 0 };
+  const cursor = p.isStream ? (p.streamId ? decodeCursor(p.streamId) : makeCursor(p)) : null;
+  const query = cursor ? cursor.q : p.query;
+  const lang = cursor ? (cursor.l || 'en-US') : p.lang;
+  const faviconFlag = cursor ? cursor.f === 1 : p.favicon;
+  const targetTotal = cursor ? cursor.n : p.results;
+  let first = cursor ? cursor.s : 1;
+  let nextRank = cursor ? cursor.r : 1;
+
+  let totalResults = null;
+  let lastParse = null;
+  const collected = [];
+  const seen = new Set();
+  const maxPages = p.isStream ? 1 : NONSTREAM_MAX_PAGES;
+
+  for (let page = 0; page < maxPages && collected.length < targetTotal; page++) {
+    const count = Math.min(targetTotal - collected.length, PAGE_SIZE_MAX);
+    const bingUrl = buildBingUrl({ query, count, first, lang });
+    const html = await fetchBingViaQueue(bingUrl, lang, timings, env);
+
+    const pt = now();
+    const parsed = parseBingSerp(html);
+    timings.parse += now() - pt;
+    lastParse = parsed;
+
+    if (totalResults === null) totalResults = parsed.totalResults;
+
+    if (parsed.results.length === 0) break; // empty/blocked page → stop paging
+    for (const r of parsed.results) {
+      const k = dedupeKey(r.url);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      collected.push(r);
+    }
+    first += parsed.results.length; // continue AFTER the last result actually received
+  }
+
+  const totalMs = now() - t0;
+
+  // 5) Failure taxonomy when nothing could be collected at all
+  if (collected.length === 0) {
+    if (lastParse && lastParse.blockedMarker) {
+      throw new ApiError(502, 'UPSTREAM_BLOCKED', 'FETCH', 'Bing returned a captcha/consent/challenge page instead of search results.');
+    }
+    const isContinuation = Boolean(cursor && cursor.s > 1); // later stream batch
+    if (!isContinuation && !(lastParse && lastParse.noResultsMarker)) {
+      throw new ApiError(502, 'PARSE_ERROR', 'PARSE', 'Bing responded, but no results could be parsed — the page layout may have changed.');
+    }
+    // Genuine "no results" (or exhausted stream) → valid empty response
+    const empty = {};
+    if (p.showTelemetry) empty['shown-telemetry'] = buildTelemetry(timings, totalMs, pingMs);
+    if (p.isStream) {
+      empty['stream-id'] = null;
+      empty['has-more'] = false;
+    }
+    empty.stats = { 'total-results': (lastParse && lastParse.totalResults) || 0 };
+    empty.results = [];
+    return finalize(request, env, requestId, empty, timings, totalMs, rl);
+  }
+
+  // 6) Rank, slice to the promised quantity, apply response flags
+  const take = Math.min(collected.length, targetTotal - (nextRank - 1));
+  const batch = [];
+  for (let i = 0; i < take; i++) {
+    const r = collected[i];
+    const item = { rank: nextRank + i, title: r.title, url: r.url };
+    if (faviconFlag) {
+      const fav = r.favicon || faviconFallback(r.url);
+      if (fav) item.favicon = fav;
+    }
+    if (r.path) item.path = r.path;
+    if (r.summary) item.summary = r.summary;
+    batch.push(item);
+  }
+  const endRank = nextRank + batch.length;
+  const remaining = targetTotal - endRank + 1;
+  const moreAvailable = batch.length > 0 && remaining > 0 && first <= BING_FIRST_MAX;
+
+  // 7) Assemble the response (schema order: telemetry → stream → stats → results)
+  const response = {};
+  if (p.showTelemetry) response['shown-telemetry'] = buildTelemetry(timings, totalMs, pingMs);
+  if (p.isStream) {
+    response['stream-id'] = moreAvailable
+      ? encodeCursor({ q: query, l: lang, f: faviconFlag ? 1 : 0, n: targetTotal, s: first, r: endRank })
+      : null;
+    response['has-more'] = moreAvailable;
+  }
+  response.stats = { 'total-results': totalResults == null ? endRank - 1 : totalResults };
+  response.results = batch;
+
+  return finalize(request, env, requestId, response, timings, totalMs, rl);
+}
+
+/** Stable dedupe key (host + path, tracking params stripped, trailing slash ignored). */
+function dedupeKey(url) {
   try {
     const u = new URL(url);
-    return u.hostname.replace(/^www\./, "").toLowerCase() +
-      u.pathname.replace(/\/+$/, "") + u.search;
+    for (const t of ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content']) u.searchParams.delete(t);
+    let key = `${u.hostname.toLowerCase()}${u.pathname.replace(/\/+$/, '')}`;
+    const qs = [...u.searchParams].sort().map(([k, v]) => `${k}=${v}`).join('&');
+    if (qs) key += '?' + qs;
+    return key;
   } catch {
     return url;
   }
 }
 
-function isInternalBingUrl(url) {
-  const host = safeHost(url);
-  return !host || /(^|\.)bing\.com$/i.test(host);
-}
-
-/** Parse a single <li class="b_algo"> block. Returns null when not a usable result. */
-function parseResultBlock(blockHtml, includeFavicon) {
-  const body = blockHtml.replace(RE_STYLE_BLOCK, " ");
-
-  // --- Title + URL. Prefer the h2 anchor (the .tilk site-line anchor that
-  // --- appears FIRST in modern blocks carries the site name, not the title).
-  let href = null;
-  let title = null;
-  const h2 = /<h2\b[^>]*>([\s\S]*?)<\/h2>/i.exec(body);
-  if (h2) {
-    const a = /<a\b([^>]*)>([\s\S]{2,600}?)<\/a>/i.exec(h2[1]);
-    if (a) { href = attrValue(a[1], "href"); title = stripTags(a[2]); }
-  }
-  if (!href) {
-    const bTitle = /<div\b[^>]*\bclass="[^"]*\bb_title\b[^"]*"[^>]*>([\s\S]{0,2000}?)<\/div>/i
-      .exec(body);
-    if (bTitle) {
-      const a = /<a\b([^>]*)>([\s\S]{2,600}?)<\/a>/i.exec(bTitle[1]);
-      if (a) { href = attrValue(a[1], "href"); title = stripTags(a[2]); }
-    }
-  }
-  if (!href) {
-    // Last resort within the block: the anchor with the longest visible text.
-    let best = null;
-    for (const m of body.matchAll(/<a\b([^>]*)>([\s\S]{2,400}?)<\/a>/gi)) {
-      const h = attrValue(m[1], "href");
-      const t = stripTags(m[2]);
-      if (!h || t.length < 3) continue;
-      if (!best || t.length > best.title.length) best = { href: h, title: t };
-    }
-    if (best) { href = best.href; title = best.title; }
-  }
-  if (!href || !title) return null;
-
-  const url = decodeBingRedirect(href);
-  if (!/^https?:\/\//i.test(url)) return null;   // internal/relative link
-  if (isInternalBingUrl(url)) return null;       // bing.com self-references
-  if (title.length > 400) title = title.slice(0, 400);
-
-  const host = safeHost(url);
-  const snippet = parseSnippet(body);
-  const favicon = includeFavicon ? parseFavicon(body, host) : undefined;
-
-  return {
-    title,
-    url,
-    snippet,
-    ...(favicon ? { favicon } : {}),
-    quality: "Unknown", // assigned positionally by parseSerp()
-  };
-}
-
-/** Layout-drift fallback: harvest h2 anchors anywhere in the document. */
-function parseLoose(html, seen, includeFavicon, wanted) {
-  const out = [];
-  for (const m of html.matchAll(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi)) {
-    if (out.length >= wanted) break;
-    const a = /<a\b([^>]*)>([\s\S]{2,400}?)<\/a>/i.exec(m[1]);
-    if (!a) continue;
-    const href = attrValue(a[1], "href");
-    if (!href) continue;
-    const url = decodeBingRedirect(href);
-    if (!/^https?:\/\//i.test(url) || isInternalBingUrl(url)) continue;
-    const title = stripTags(a[2]);
-    if (title.length < 3) continue;
-    const key = normalizeUrlKey(url);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const host = safeHost(url);
-    out.push({
-      title,
-      url,
-      snippet: "",
-      ...(includeFavicon ? { favicon: `https://icons.duckduckgo.com/ip3/${host}.ico` } : {}),
-      quality: "Unknown",
-    });
-  }
-  return out;
-}
-
-/** Deterministic quality tier (see header docs). */
-function assignQuality(result, position, pageIdx) {
-  if (!result.snippet || result.snippet.length < 10) return "Unknown";
-  let tier = position === 1 ? 5
-    : position <= 3 ? 4
-    : position <= 6 ? 3
-    : position <= 10 ? 2
-    : 1;
+/** Deterministic favicon fallback when Bing's own markup carries none. */
+function faviconFallback(url) {
   try {
-    const host = new URL(result.url).hostname.toLowerCase();
-    if (/\.(gov|edu|mil|int)$/.test(host)) tier = Math.min(5, tier + 1);
-    if (result.url.startsWith("http://")) tier = Math.max(0, tier - 1);
-  } catch { /* unreachable — url already validated */ }
-  // Deep-pagination demotion (weaker matches on page 2+), but never stacks
-  // with the position penalty below Subpar.
-  if (pageIdx >= 1 && tier > 1) tier -= 1;
-  return QUALITY_TIERS[Math.max(0, Math.min(5, tier))];
+    const host = new URL(url).hostname;
+    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=32`;
+  } catch {
+    return null;
+  }
 }
 
-/**
- * Parse one Bing SERP page.
- * opts: { seen, includeFavicon, wanted, startIndex, pageIdx }
- * Returns { results, totalResults, containerFound, rawBlocks, noResults }.
- *
- * Tier A: li.b_algo blocks (current Bing layout — verified against a real
- *         2026 SERP capture; tolerates nested <style>, multi-class attrs,
- *         .tilk site-lines, b_lineclamp snippets).
- * Tier B: zero b_algo found but container present -> loose h2 harvest.
- * Tier C: container missing entirely -> containerFound=false; the caller
- *         fails loud with 502 upstream_changed instead of returning fake
- *         empty results.
- */
-function parseSerp(html, opts = {}) {
-  const seen = opts.seen || new Set();
-  const includeFavicon = !!opts.includeFavicon;
-  const wanted = opts.wanted || Infinity;
-  const startIndex = opts.startIndex || 0;
-  const pageIdx = opts.pageIdx || 0;
-
-  const totalResults = parseTotalResults(html);
-  const containerFound = RE_RESULTS_CONTAINER.test(html);
-  const results = [];
-  let rawBlocks = 0;
-
-  if (containerFound) {
-    for (const m of html.matchAll(/<li\b[^>]*\bclass="([^"]*)"[^>]*>([\s\S]*?)<\/li>/gi)) {
-      const cls = m[1];
-      if (!/\bb_algo\b/.test(cls)) continue;
-      if (/\bb_ad\b|\bsb_ad\b/.test(cls)) continue; // ads / sponsored
-      rawBlocks += 1;
-      if (results.length >= wanted) continue;
-      const r = parseResultBlock(m[2], includeFavicon);
-      if (!r) continue;
-      const key = normalizeUrlKey(r.url);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      r.quality = assignQuality(r, startIndex + results.length + 1, pageIdx);
-      results.push(r);
-    }
-    if (rawBlocks === 0) {
-      for (const r of parseLoose(html, seen, includeFavicon, wanted)) {
-        results.push(r); // degraded mode: quality stays "Unknown"
-      }
-    }
-  }
-
-  return {
-    results,
-    totalResults,
-    containerFound,
-    rawBlocks,
-    noResults: RE_NO_RESULTS.test(html),
-    consentWall: RE_CONSENT_WALL.test(html) && !containerFound,
-  };
-}
-
-/** Registrable domain (pragmatic public-suffix handling for url_tree grouping). */
-function registrableDomain(hostname) {
-  const host = hostname.toLowerCase().replace(/\.$/, "");
-  const labels = host.split(".");
-  if (labels.length <= 2) return host;
-  const SECOND_LEVEL_SUFFIXES = new Set([
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "ne.jp", "or.jp", "ac.jp",
-    "com.au", "net.au", "org.au", "com.br", "com.cn", "com.mx", "co.in",
-    "co.nz", "co.za", "com.sg", "com.tr", "com.ar", "com.pl", "com.tw",
-  ]);
-  const lastTwo = labels.slice(-2).join(".");
-  if (SECOND_LEVEL_SUFFIXES.has(lastTwo) && labels.length >= 3) {
-    return labels.slice(-3).join(".");
-  }
-  return lastTwo;
-}
-
-/** url_tree: domain breakdown of the result set (OpenAPI "query domain breakdown"). */
-function buildUrlTree(results, maxCategories = 5) {
-  const byHost = new Map(); // registrable domain -> Map(pathSegment -> count)
-  for (const r of results) {
-    let domain, segment;
-    try {
-      const u = new URL(r.url);
-      domain = registrableDomain(u.hostname);
-      segment = "/" + (u.pathname.split("/").filter(Boolean)[0] || "");
-    } catch { continue; }
-    if (!byHost.has(domain)) byHost.set(domain, new Map());
-    const segs = byHost.get(domain);
-    segs.set(segment, (segs.get(segment) || 0) + 1);
-  }
-  const total = (segs) => [...segs.values()].reduce((a, b) => a + b, 0);
-  return [...byHost.entries()]
-    .sort((a, b) => total(b[1]) - total(a[1]) || a[0].localeCompare(b[0]))
-    .slice(0, maxCategories)
-    .map(([domain, segs]) => ({
-      category: domain,
-      subcategories: [...segs.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 6)
-        .map(([s]) => s),
-    }));
-}
-
-// ---------------------------------------------------------------------------
-// Request-body validation (OpenAPI-shaped, strict with documented coercions)
-// ---------------------------------------------------------------------------
-
-function validatePayload(raw, env) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new HttpError(400, "invalid_body", "Request body must be a JSON object.");
-  }
-
-  // request (required)
-  if (typeof raw.request !== "string") {
-    throw new HttpError(400, "invalid_request",
-      "'request' is required and must be a string.");
-  }
-  const query = raw.request.trim();
-  if (!query) {
-    throw new HttpError(400, "missing_query", "'request' must not be empty.");
-  }
-  if (query.length > LIMITS.queryMaxChars) {
-    throw new HttpError(400, "invalid_query",
-      `'request' must be at most ${LIMITS.queryMaxChars} characters.`);
-  }
-
-  // lang (optional)
-  let lang;
-  if (raw.lang !== undefined && raw.lang !== null && raw.lang !== "") {
-    if (typeof raw.lang !== "string" ||
-        !/^[a-z]{2,3}(?:[-_][a-z0-9]{2,8})?$/i.test(raw.lang)) {
-      throw new HttpError(400, "invalid_lang",
-        "'lang' must be a language code such as 'es', 'fr', 'ja' or 'pt-BR'.");
-    }
-    lang = raw.lang.replace("_", "-");
-  }
-
-  // key (optional)
-  let key;
-  if (raw.key !== undefined && raw.key !== null && raw.key !== "") {
-    if (typeof raw.key !== "string" || raw.key.length > LIMITS.keyMaxChars) {
-      throw new HttpError(400, "invalid_key", "'key' must be a string (max 256 chars).");
-    }
-    key = raw.key;
-  }
-
-  // include_favicon (optional, default false; "true"/"false" tolerated)
-  let includeFavicon = false;
-  if (raw.include_favicon !== undefined && raw.include_favicon !== null) {
-    const v = raw.include_favicon;
-    if (typeof v === "boolean") includeFavicon = v;
-    else if (v === "true") includeFavicon = true;
-    else if (v === "false") includeFavicon = false;
-    else {
-      throw new HttpError(400, "invalid_include_favicon",
-        "'include_favicon' must be a boolean.");
-    }
-  }
-
-  // result_number (optional, default 10; numeric string tolerated)
-  let resultNumber = 10;
-  if (raw.result_number !== undefined && raw.result_number !== null) {
-    let v = raw.result_number;
-    if (typeof v === "string" && /^-?\d+$/.test(v.trim())) v = parseInt(v.trim(), 10);
-    if (typeof v !== "number" || !Number.isInteger(v)) {
-      throw new HttpError(400, "invalid_result_number",
-        "'result_number' must be an integer between 1 and 100.");
-    }
-    const max = Math.max(LIMITS.resultNumberMin,
-      Math.min(LIMITS.resultNumberMax, intVal(env.MAX_RESULT_NUMBER, 100)));
-    if (v < LIMITS.resultNumberMin || v > max) {
-      throw new HttpError(400, "out_of_range_result_number",
-        `'result_number' must be between ${LIMITS.resultNumberMin} and ${max}.`);
-    }
-    resultNumber = v;
-  }
-
-  return { query, lang, key, includeFavicon, resultNumber };
-}
-
-// ---------------------------------------------------------------------------
-// Search orchestration (pagination + telemetry)
-// ---------------------------------------------------------------------------
-
-/**
- * Run the full search: paginate Bing until `resultNumber` unique results are
- * collected (or Bing runs dry). Every upstream GET goes through the 6-slot
- * concurrency queue. Returns everything needed for the OpenAPI response body.
- */
-async function searchBing(payload, env, signal) {
-  const limiter = getLimiter(intVal(env.BING_MAX_CONCURRENCY, 6));
-  const headers = buildBingHeaders(payload.lang);
-
-  const seen = new Set();
-  const collected = [];
-  const timing = { queueWaitMs: 0, fetchMs: 0, parseMs: 0, pages: 0 };
-  let totalResults = null;
-  let first = 1;
-  let pageIdx = 0;
-  const maxPages = Math.min(
-    Math.ceil(payload.resultNumber / LIMITS.minResultsPerPageGuess),
-    intVal(env.MAX_PAGES, LIMITS.maxPagesHardCap)
+/** Attach Server-Timing (+ X-Rate-Limit-* when a limit is active) to a JSON response. */
+function finalize(request, env, requestId, data, timings, totalMs, rl) {
+  const extra = new Headers();
+  extra.set(
+    'Server-Timing',
+    `que;dur=${round1(timings.que)}, fetch;dur=${round1(timings.fetch)}, parse;dur=${round1(timings.parse)}, total;dur=${round1(totalMs)}`
   );
-
-  while (collected.length < payload.resultNumber && pageIdx < maxPages) {
-    const url = buildBingUrl(payload.query, { lang: payload.lang, first });
-
-    let page;
-    try {
-      page = await fetchBingPage(url, headers, signal, env, limiter);
-    } catch (err) {
-      if (err instanceof HttpError && err.code === "upstream_empty") {
-        if (pageIdx === 0) throw err;
-        break; // later page came back empty — treat as exhaustion
-      }
-      throw err;
-    }
-    timing.queueWaitMs += page.queueMs;
-    timing.fetchMs += page.fetchMs;
-    timing.pages += 1;
-
-    const tParse = nowMs();
-    const parsed = parseSerp(page.html, {
-      seen,
-      includeFavicon: payload.includeFavicon,
-      wanted: payload.resultNumber - collected.length,
-      startIndex: collected.length,
-      pageIdx,
-    });
-    timing.parseMs += nowMs() - tParse;
-
-    if (totalResults === null && parsed.totalResults !== null) {
-      totalResults = parsed.totalResults; // first page's count wins
-    }
-    if (!parsed.containerFound) {
-      if (parsed.consentWall) {
-        throw new HttpError(502, "upstream_blocked",
-          "Bing served a consent/interstitial page instead of results.");
-      }
-      throw new HttpError(502, "upstream_changed",
-        "Bing returned an unexpected page layout (no results container). The parser may need an update.");
-    }
-
-    let added = 0;
-    for (const r of parsed.results) {
-      if (collected.length >= payload.resultNumber) break;
-      collected.push(r);
-      added += 1;
-    }
-    if (parsed.rawBlocks === 0 || added === 0) break; // exhausted or all dupes
-
-    first += Math.max(parsed.rawBlocks, 1);
-    pageIdx += 1;
+  if (rl && rl.remaining != null && rl.resetAt) {
+    extra.set('X-Rate-Limit-Limit', String(parseRateLimit(env && env.RATE_LIMIT)));
+    extra.set('X-Rate-Limit-Remaining', String(rl.remaining));
+    extra.set('X-Rate-Limit-Reset', String(Math.ceil(rl.resetAt / 1000)));
   }
-
-  return {
-    results: collected,
-    totalResults: totalResults ?? collected.length,
-    urlTree: buildUrlTree(collected),
-    queueDepth: limiter.depth(),
-    timing,
-  };
+  return jsonResponse(request, env, requestId, data, { extra });
 }
 
-// ---------------------------------------------------------------------------
-// Router — Worker entry point
-// ---------------------------------------------------------------------------
+/* ============================ worker entry point ========================== */
 
-function normalizePath(pathname) {
-  if (pathname.length > 1 && pathname.endsWith("/")) {
-    return pathname.slice(0, -1);
-  }
-  return pathname;
-}
-
-async function handleFetch(request, env = {}, _ctx = {}) {
-  const t0 = nowMs();
-  const requestId = newRequestId();
-  const cors = corsHeaders(env, request);
+async function fetch(request, env, ctx) {
+  const requestId = uuid();
   try {
-    const { pathname } = new URL(request.url);
-    if (normalizePath(pathname) !== "/api/v1") {
-      return jsonResponse(404, {
-        error: "not_found",
-        message: `Unknown route '${pathname}'. Use POST /api/v1/.`,
-      }, cors);
-    }
-
-    // CORS preflight (browsers POST with Content-Type: application/json)
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: { ...cors, allow: "POST, OPTIONS", "cache-control": "no-store" },
-      });
-    }
-
-    if (request.method !== "POST") {
-      return jsonResponse(405, {
-        error: "method_not_allowed",
-        message: `Method ${request.method} is not allowed. Use POST with a JSON body.`,
-      }, { ...cors, allow: "POST, OPTIONS" });
-    }
-
-    checkRateLimit(env, request);
-
-    // --- Body guards -------------------------------------------------------
-    const maxBodyBytes = intVal(env.MAX_BODY_BYTES, 16384);
-    const contentLength = parseInt(request.headers.get("content-length") || "0", 10);
-    if (contentLength > maxBodyBytes) {
-      throw new HttpError(413, "payload_too_large",
-        `Request body exceeds ${maxBodyBytes} bytes.`);
-    }
-    const contentType = (request.headers.get("content-type") || "").toLowerCase();
-    if (contentType && !contentType.includes("json")) {
-      throw new HttpError(415, "unsupported_media_type",
-        "Content-Type must be application/json.");
-    }
-    const text = await request.text();
-    if (text.length > maxBodyBytes) {
-      throw new HttpError(413, "payload_too_large",
-        `Request body exceeds ${maxBodyBytes} bytes.`);
-    }
-    let raw;
-    try {
-      raw = JSON.parse(text);
-    } catch {
-      throw new HttpError(400, "invalid_json", "Request body is not valid JSON.");
-    }
-
-    // --- Validation + auth -------------------------------------------------
-    const payload = validatePayload(raw, env);
-    await checkAuth(env, payload.key);
-
-    // --- Search ------------------------------------------------------------
-    const search = await searchBing(payload, env, request.signal || undefined);
-    const elapsed = nowMs() - t0;
-
-    const body = {
-      query: payload.query,
-      ...(payload.lang ? { translated_query: payload.query } : {}),
-      total_results: search.totalResults,
-      response_time_ms: elapsed,
-      request_id: requestId,
-      url_tree: search.urlTree,
-      latency_info: {
-        inflight_time_ms: search.timing.queueWaitMs + search.timing.fetchMs,
-        search_execution_ms: search.timing.fetchMs,
-        queue_wait_ms: search.timing.queueWaitMs,
-        pages_fetched: search.timing.pages,
-        parsing_ms: search.timing.parseMs,
-        queue_depth: search.queueDepth,
-      },
-      results: search.results,
-    };
-
-    console.log(
-      `[serp] rid=${requestId} q="${payload.query.slice(0, 60)}"` +
-      ` results=${search.results.length} pages=${search.timing.pages}` +
-      ` queue_wait=${search.timing.queueWaitMs}ms fetch=${search.timing.fetchMs}ms` +
-      ` total=${elapsed}ms status=200`
-    );
-    return jsonResponse(200, body, cors);
+    return await route(request, env || {}, requestId);
   } catch (err) {
-    if (err instanceof HttpError) {
-      console.warn(`[serp] rid=${requestId} status=${err.status} code=${err.code}`);
-      return jsonResponse(err.status, {
-        error: err.code,
-        message: err.message,
-        ...(err.details ? { details: err.details } : {}),
-      }, cors);
-    }
-    const clientGone = err?.name === "AbortError" || request.signal?.aborted;
-    if (clientGone) {
-      // Client disconnected (or aborted while queued): nothing to deliver.
-      return new Response(null, { status: 499 });
-    }
-    console.error(`[serp] rid=${requestId} internal error:`, err?.stack || err);
-    return jsonResponse(500, {
-      error: "internal_error",
-      message: "An unexpected error occurred.",
-      request_id: requestId,
-    }, cors);
+    if (err instanceof ApiError) return errorResponse(request, env || {}, requestId, err);
+    console.error(`[free-serp-api ${requestId}] unhandled error:`, safeMsg(err));
+    return errorResponse(
+      request,
+      env || {},
+      requestId,
+      new ApiError(500, 'INTERNAL_ERROR', 'INTERNAL', 'An unexpected internal error occurred.')
+    );
   }
 }
 
-// ---------------------------------------------------------------------------
-// Exports — Worker entry point + pure functions for automated tests
-// ---------------------------------------------------------------------------
-
-export default { fetch: handleFetch };
-
-export {
-  VERSION,
-  HttpError,
-  validatePayload,
-  checkAuth,
-  safeEqualStrings,
-  isTruthy,
-  intVal,
-  decodeEntities,
-  stripTags,
-  b64urlDecode,
-  decodeBingRedirect,
-  buildBingUrl,
-  buildBingHeaders,
-  langToMkt,
-  toAcceptLanguage,
-  parseSerp,
-  parseResultBlock,
-  parseSnippet,
-  parseFavicon,
-  parseTotalResults,
-  buildUrlTree,
-  assignQuality,
-  normalizeUrlKey,
-  searchBing,
-  handleFetch,
-};
-
-/** Test-only surface: reset module-scope state between test cases. */
-export const __internals = {
-  FairSemaphore,
-  getLimiter,
-  limiterRegistry,
-  rateBuckets,
-  OUTBOUND_HEADER_ALLOWLIST,
-  FORBIDDEN_OUTBOUND,
-  STRIP_INBOUND,
-  resetForTests() {
-    limiterRegistry.clear();
+/* ============================== test hooks ================================ */
+/** Not used by the runtime — lets the offline test-suite reset per-isolate state. */
+const __testHooks = {
+  resetState() {
     rateBuckets.clear();
+    bingQueue = new Semaphore(OUTBOUND_CONCURRENCY);
+  },
+  queue() {
+    return bingQueue;
   },
 };
-
-/*
- * ============================================================================
- * SCALING NOTE (global 6-slot guarantee)
- * ============================================================================
- * Cloudflare runs many isolates of a Worker in parallel; module-scope state is
- * shared only within one isolate. The FairSemaphore here therefore enforces
- * "at most 6 concurrent Bing GETs" per isolate, which in practice keeps the
- * aggregate rate well-behaved, but it is NOT a hard global cap.
- *
- * For a hard global cap, move the semaphore into a Durable Object:
- *
- *   // wrangler.toml:
- *   //   [[durable_objects.bindings]]
- *   //   name = "QUEUE"; class_name = "SearchQueue"
- *   //   [[migrations]]; tag = "v1"; new_sqlite_classes = ["SearchQueue"]
- *   //
- *   // export class SearchQueue {
- *   //   constructor(state) { this.state = state; this.sem = new FairSemaphore(6); }
- *   //   async fetch(req) { return handleFetch(req, req.env, null); } // same handler,
- *   // }                                                 // semaphore now DO-scoped
- *
- * and route fetchBingPage's acquire/release through `env.QUEUE.fetch(...)`.
- * Everything else in this file stays unchanged.
- * ============================================================================
- */
