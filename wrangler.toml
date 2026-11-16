@@ -1,67 +1,24 @@
-# ============================================================================
-#  free-serp-api — wrangler configuration  ·  v1.1.0
-# ============================================================================
-#  Deploy:            npx wrangler deploy
-#  Local dev:         npx wrangler dev           (http://127.0.0.1:8787)
-#  Add API keys:      npx wrangler secret put KEY-1     (then KEY-2, KEY-3, …)
-#  Tail live logs:    npx wrangler tail
-#
-#  Layout: this file, worker.js and script.js in the same directory:
-#      free-serp-api/
-#      ├── wrangler.toml   ← you are here
-#      ├── worker.js       ← the entire server (single-file, zero-dependency)
-#      ├── script.js       ← optional companion browser/Node client
-#      ├── tests.mjs       ← offline validation suite (node tests.mjs)
-#      └── fixtures/       ← Bing SERP sample used by tests.mjs
-# ============================================================================
+# free-serp-api — Cloudflare Worker configuration
+# Deploy:  npx wrangler deploy
+# Secret: npx wrangler secret put KEY-1   (only needed when REQUIRE_KEY = "true")
 
 name = "free-serp-api"
 main = "worker.js"
-compatibility_date = "2025-06-01"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
-# For a custom route instead of *.workers.dev, uncomment and edit:
-# routes = [{ pattern = "api.example.com/api/v1/*", custom_domain = true }]
-
-[observability]
-enabled = true
-head_sampling_rate = 1.0
-
-# Optional CPU guard (default is fine for this workload — parsing is ~ms):
-# [limits]
-# cpu_ms = 50
 
 [vars]
-# ----------------------------------------------------------------------------
-# PUBLIC configuration (NOT secret — safe to commit).
-# Cloudflare [vars] are always strings on the `env` object.
-# ----------------------------------------------------------------------------
-
-# Authentication toggle. "false" (default) → the API is open, `key` in the
-# request body is ignored entirely. "true" → every request must carry a `key`
-# matching one of the KEY-1 … KEY-n secrets (set via `wrangler secret put`).
 REQUIRE_KEY = "false"
+RATE_LIMITING = "0"
 
-# Client rate limiting, per client IP (CF-Connecting-IP), sliding 60 s window.
-#   "0"        → unlimited (default)
-#   "<number>" → fixed maximum requests per minute (e.g. "60" = 60 req/min)
-# Limited responses get HTTP 429 + Retry-After + X-Rate-Limit-* headers.
-RATE_LIMIT = "0"
+[env.locked]
+name = "free-serp-api-locked"
+workers_dev = true
 
-# Default target language when a request omits "lang" (RFC-1766 code).
-DEFAULT_LANG = "en-US"
+[env.locked.vars]
+REQUIRE_KEY = "true"
+RATE_LIMITING = "60"
 
-# CORS: "*" (default, no credentials are ever used) or a comma-separated list
-# of exact origins, e.g. "https://example.com,https://app.example.com".
-CORS_ORIGIN = "*"
-
-# Optional operational overrides (safe defaults if omitted):
-# QUEUE_WAIT_MS        = "15000"   # max wait for a free Bing slot before 503
-# UPSTREAM_TIMEOUT_MS  = "10000"   # per-attempt timeout fetching Bing
-
-# ----------------------------------------------------------------------------
-# SECRETS — never put real key values in this file. Use the CLI instead:
-#    npx wrangler secret put KEY-1
-#    npx wrangler secret put KEY-2
-# They surface as env["KEY-1"], env["KEY-2"], … and are only consulted when
-# REQUIRE_KEY = "true". Keys are compared in constant time.
-# ----------------------------------------------------------------------------
+# Secrets for the locked env:
+#   npx wrangler secret put KEY-1 --env locked
